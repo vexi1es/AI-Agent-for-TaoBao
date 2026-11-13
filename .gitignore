@@ -1,0 +1,12 @@
+*.key
+bin/
+models/
+venv/
+rust/
+dl/
+app/target/
+data/*
+!data/glossary.json
+bench/*.log
+bench/*_out.json
+bench/cmp_out.*
