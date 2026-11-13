@@ -11,8 +11,117 @@
   const waiting = new Map();
   const tracked = new Set();
   let hi = new Set(), lo = new Set(), timer = 0, on = true;
+  const CFG = window.__tbtr_cfg || {};
+  let groupOrig = new WeakMap();
+  let priced = new WeakMap();
 
   const keyOf = (s) => s.trim();
+  const own = (el) => !!(el && el.closest && el.closest("[data-tbtr]"));
+
+  function send(obj) {
+    try { window.__tbtr_send(JSON.stringify(obj)); } catch (e) {}
+  }
+
+  const PRICE = /^[¥￥]\s*(\d[\d\s,]*(?:\.\s*\d+)?)$/;
+
+  function fmtSum(n) {
+    const v = Math.max(0, Math.round(n / 100) * 100);
+    return v.toString().replace(/\B(?=(\d{3})+(?!\d))/g, " ") + " сум";
+  }
+
+  function priceOf(el) {
+    const m = el.textContent.replace(/\s+/g, " ").trim().match(PRICE);
+    if (!m) return null;
+    const v = parseFloat(m[1].replace(/[\s,]/g, ""));
+    return v > 0 ? v : null;
+  }
+
+  function annotate(n) {
+    if (!CFG.uzsPerCny) return;
+    let el = null, v = null;
+    for (let p = n.parentElement, i = 0; p && i < 3; p = p.parentElement, i++) {
+      if (own(p) || p.textContent.length > 24) break;
+      const x = priceOf(p);
+      if (x != null) { el = p; v = x; break; }
+    }
+    if (!el) return;
+    const text = "· " + fmtSum(v * CFG.uzsPerCny);
+    let s = priced.get(el);
+    if (s && s.isConnected) { if (s.textContent !== text) s.textContent = text; return; }
+    s = document.createElement("span");
+    s.dataset.tbtr = "uzs";
+    s.style.cssText = "margin-left:4px;font-size:11px;color:#888;font-weight:normal;white-space:nowrap";
+    s.textContent = text;
+    el.after(s);
+    priced.set(el, s);
+  }
+
+  const ITEM = /item\.htm|detail\.tmall\.com|detail\.taobao\.com/.test(location.href) && !/s\.taobao\.com\/search/.test(location.href);
+  let itemSent = 0, itemLen = 0, itemTimer = 0;
+
+  function originalText() {
+    const out = [], w = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT);
+    let x;
+    while ((x = w.nextNode())) {
+      const p = x.parentElement;
+      if (!p || SKIP.has(p.tagName) || own(p)) continue;
+      const v = (groupOrig.has(x) ? groupOrig.get(x) : origText.has(x) ? origText.get(x) : x.nodeValue).trim();
+      if (v) out.push(v);
+    }
+    return out.join("\n");
+  }
+
+  function itemCheck() {
+    if (!ITEM || itemSent >= 3) return;
+    clearTimeout(itemTimer);
+    itemTimer = setTimeout(() => {
+      const t = originalText();
+      if (t.length < 10 || (itemSent && t.length < itemLen * 1.5)) return;
+      itemSent++;
+      itemLen = t.length;
+      if (itemSent === 1) itemPanel([["🔎 Оцениваю товар…", "color:#666"]]);
+      send({ item: { url: location.href, text: t } });
+    }, CFG.itemQuietMs || 2500);
+  }
+
+  function itemPanel(rows) {
+    let p = document.querySelector("[data-tbtr=item]");
+    if (!p) {
+      p = document.createElement("div");
+      p.dataset.tbtr = "item";
+      p.style.cssText = "position:fixed;top:72px;right:16px;z-index:2147483646;width:300px;background:#fff;color:#222;" +
+        "border:1px solid #ddd;border-radius:6px;padding:10px 12px;font:13px/1.45 system-ui,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.12)";
+      (document.body || document.documentElement).appendChild(p);
+    }
+    p.replaceChildren();
+    const x = document.createElement("span");
+    x.textContent = "×";
+    x.style.cssText = "float:right;cursor:pointer;color:#999;font-size:16px;line-height:1";
+    x.onclick = () => p.remove();
+    p.appendChild(x);
+    for (const [text, css] of rows) {
+      if (!text) continue;
+      const d = document.createElement("div");
+      d.textContent = text;
+      if (css) d.style.cssText = css;
+      p.appendChild(d);
+    }
+  }
+
+  window.__tbtr_item_done = (c) => {
+    if (!c) { itemPanel([["Не удалось оценить товар", "color:#666"]]); return; }
+    const color = { good: "#1a7f37", ok: "#9a6b00", bad: "#c62828" }[c.grade] || "#222";
+    itemPanel([
+      [c.label, `font-weight:600;font-size:14px;color:${color}`],
+      [c.why],
+      [c.complaints && "Жалуются: " + c.complaints, "color:#666"],
+      [c.banned, "color:#c62828;font-weight:600"],
+      [c.price && "Цена: " + c.price],
+      [c.weight && "Вес: " + c.weight],
+      [c.cargo && "Карго: " + c.cargo],
+      [c.total, "font-weight:600"],
+    ]);
+  };
 
   function isVisible(el) {
     if (!el || !el.getBoundingClientRect) return false;
@@ -104,6 +213,7 @@
     const k = keyOf(joined);
     if (!k || k.length > 400) return;
     groups.set(el, { key: k, nodes, orig: nodes.map(t => t.nodeValue) });
+    nodes.forEach(t => groupOrig.set(t, t.nodeValue));
     tracked.add(new WeakRef(el));
     if (T.has(k)) { applyGroup(el, k); return; }
     wait(k, { deref: () => ({ group: el }) });
@@ -112,7 +222,8 @@
 
   function onText(n) {
     const p = n.parentElement;
-    if (!p || SKIP.has(p.tagName) || p.isContentEditable || p === hintEl) return;
+    if (!p || SKIP.has(p.tagName) || p.isContentEditable || own(p)) return;
+    annotate(n);
     const v = n.nodeValue;
     if (!v || shownText.get(n) === v) return;
     const g = groupOf(n);
@@ -224,6 +335,7 @@
     clearTimeout(hintT);
     if (!hintEl) {
       hintEl = document.createElement("div");
+      hintEl.dataset.tbtr = "hint";
       hintEl.style.cssText = "position:fixed;z-index:2147483647;pointer-events:none;background:#222;color:#fff;" +
         "font:12px/1.4 system-ui,sans-serif;padding:2px 8px;border-radius:4px;opacity:.92;white-space:nowrap;" +
         "max-width:70vw;overflow:hidden;text-overflow:ellipsis";
@@ -321,11 +433,13 @@
       else if (m.type === "attributes") onAttr(m.target, m.attributeName);
       else for (const n of m.addedNodes) scan(n);
     }
+    itemCheck();
   });
 
   function start() {
     scan(document.body || document.documentElement);
     mo.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ATTRS });
+    itemCheck();
   }
 
   function reset() {
@@ -333,6 +447,8 @@
     on = false; refreshAll();
     T.clear(); waiting.clear(); tracked.clear();
     origText = new WeakMap(); shownText = new WeakMap(); origAttr = new WeakMap(); groups = new WeakMap();
+    groupOrig = new WeakMap(); priced = new WeakMap();
+    document.querySelectorAll("[data-tbtr=uzs]").forEach(s => s.remove());
     on = wasOn;
     scan(document.body || document.documentElement);
   }

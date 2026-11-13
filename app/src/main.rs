@@ -1,5 +1,7 @@
 mod cloud;
 mod translate;
+mod item;
+mod money;
 mod warp;
 
 use anyhow::{anyhow, Context, Result};
@@ -21,6 +23,19 @@ const CDP_PORT: u16 = 9333;
 const MODEL_PORT: u16 = 8089;
 const LOCAL_WORKERS: usize = 2;
 const INJECT: &str = include_str!("inject.js");
+static SCRIPT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn script() -> &'static str {
+    SCRIPT.get().map(String::as_str).unwrap_or(INJECT)
+}
+
+fn page_config(rates: Option<&money::Rates>, s: &money::Settings) -> String {
+    let cfg = match rates {
+        Some(r) => json!({"uzsPerCny": r.uzs_per_cny * s.markup}),
+        None => json!({}),
+    };
+    format!("window.__tbtr_cfg={cfg};")
+}
 
 struct Cdp {
     tx: mpsc::UnboundedSender<Message>,
@@ -176,8 +191,8 @@ async fn setup_session(cdp: Arc<Cdp>, state: Shared, target: String, session: St
     let r = async {
         cdp.call("Runtime.enable", json!({}), Some(&session)).await?;
         cdp.call("Runtime.addBinding", json!({"name": "__tbtr_send"}), Some(&session)).await?;
-        let _ = cdp.call("Page.addScriptToEvaluateOnNewDocument", json!({"source": INJECT}), Some(&session)).await;
-        cdp.call("Runtime.evaluate", json!({"expression": INJECT}), Some(&session)).await?;
+        let _ = cdp.call("Page.addScriptToEvaluateOnNewDocument", json!({"source": script()}), Some(&session)).await;
+        cdp.call("Runtime.evaluate", json!({"expression": script()}), Some(&session)).await?;
         anyhow::Ok(())
     }
     .await;
@@ -411,6 +426,55 @@ async fn local_worker(state: Shared, cdp: Arc<Cdp>, wake: Arc<Notify>, id: usize
 
 type Clouds = Arc<Vec<(Arc<Cloud>, Arc<std::sync::Mutex<Usage>>)>>;
 
+struct Shop {
+    rates: Option<money::Rates>,
+    settings: money::Settings,
+    seen: std::sync::Mutex<HashMap<String, (usize, Value)>>,
+}
+
+fn item_key(url: &str) -> String {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[?&]id=(\d+)").unwrap())
+        .captures(url)
+        .map_or_else(|| url.split('#').next().unwrap_or(url).to_string(), |c| c[1].to_string())
+}
+
+async fn judge(clouds: &Clouds, shop: &Shop, url: &str, text: &str) -> Option<Value> {
+    let key = item_key(url);
+    let digest = item::digest(text, 6000);
+    if let Some((len, card)) = shop.seen.lock().unwrap().get(&key).cloned() {
+        if digest.len() * 2 <= len * 3 {
+            return Some(card);
+        }
+    }
+    let (cloud, c, usage) = clouds.iter().find_map(|(c, u)| match &**c {
+        Cloud::Claude(cl) => Some((c, cl, u)),
+        Cloud::Gemini(_) => None,
+    })?;
+    usage.lock().unwrap().add(1);
+    let t = Instant::now();
+    let (o, usd) = c.ask(item::ITEM_PROMPT, &digest, item::schema()).await.ok()?;
+    usage.lock().unwrap().spend(usd);
+    let mut v = item::parse_verdict(&o).ok()?;
+    let left = v.chinese_left();
+    if !left.is_empty() {
+        usage.lock().unwrap().add(left.len());
+        if let Ok(done) = cloud.translate(&left, &[]).await {
+            usage.lock().unwrap().spend(done.usd);
+            v.replace(&left.into_iter().zip(done.lines).collect::<Vec<_>>());
+        }
+    }
+    let card = item::card(&v, shop.rates.as_ref(), &shop.settings);
+    println!("🏷 {:>5}ms  {} · {} · {}", t.elapsed().as_millis(), card["label"].as_str().unwrap_or(""), cut(&v.why, 50), card["total"].as_str().unwrap_or(""));
+    shop.seen.lock().unwrap().insert(key, (digest.len(), card.clone()));
+    Some(card)
+}
+
+async fn on_item(cdp: &Arc<Cdp>, clouds: &Clouds, shop: &Shop, session: &str, url: String, text: String) {
+    let card = judge(clouds, shop, &url, &text).await.unwrap_or(Value::Null);
+    cdp.eval(session, format!("window.__tbtr_item_done&&window.__tbtr_item_done({card})"));
+}
+
 async fn on_search(state: &Shared, cdp: &Arc<Cdp>, clouds: &Clouds, session: &str, id: u64, ru: String) {
     let t = Instant::now();
     let known = state.lock().await.tr.search_cached(&ru);
@@ -582,9 +646,12 @@ fn find_root() -> PathBuf {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let _single = match std::net::TcpListener::bind("127.0.0.1:9339") {
-        Ok(l) => l,
-        Err(_) => {
+    let args: Vec<String> = std::env::args().collect();
+    let judge_file = args.windows(2).find(|w| w[0] == "--judge-file").map(|w| w[1].clone());
+    let _single = match (&judge_file, std::net::TcpListener::bind("127.0.0.1:9339")) {
+        (Some(_), _) => None,
+        (None, Ok(l)) => Some(l),
+        (None, Err(_)) => {
             println!("Переводчик уже запущен в другом окне.");
             return Ok(());
         }
@@ -596,7 +663,7 @@ async fn main() -> Result<()> {
     let tr = Translator::load(&data, &format!("http://127.0.0.1:{MODEL_PORT}/v1/chat/completions"))?;
     println!("Словарь и кэш: {} готовых переводов", tr.cache.len());
 
-    let local = !std::env::args().any(|a| a == "--no-local");
+    let local = !args.iter().any(|a| a == "--no-local");
     println!(
         "Режим: {}",
         if local { "облако + RTX (личные страницы переводит RTX)" } else { "лёгкий, без локальной модели (личные страницы — только словарь)" }
@@ -617,6 +684,28 @@ async fn main() -> Result<()> {
     for (i, c) in clouds.iter().enumerate() {
         let role = if i == 0 { "основное" } else { "запасное" };
         println!("Облако {role}: {} ({}) — тексты и названия, кроме личных страниц.", c.name(), c.model());
+    }
+    let cloud_count = clouds.len();
+    let clouds: Clouds = Arc::new(clouds.into_iter().map(|c| (c.clone(), Arc::new(std::sync::Mutex::new(c.usage(&data))))).collect());
+
+    let settings = money::Settings::load(&data);
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let rates = money::Rates::load(&data, &http).await;
+    match &rates {
+        Some(r) => println!(
+            "Курс ЦБ на {}: 1 ¥ = {:.2} сум, 1 $ = {:.2} сум; наценка ×{}, карго {} ${}/кг.",
+            r.date, r.uzs_per_cny, r.uzs_per_usd, settings.markup, settings.cargo_name, settings.cargo_usd_per_kg
+        ),
+        None => println!("Курс ЦБ недоступен — цены в сумах не показываю."),
+    }
+    let _ = SCRIPT.set(page_config(rates.as_ref(), &settings) + INJECT);
+    let shop = Arc::new(Shop { rates, settings, seen: std::sync::Mutex::new(HashMap::new()) });
+
+    if let Some(f) = judge_file {
+        let text = std::fs::read_to_string(&f).with_context(|| f.clone())?;
+        let card = judge(&clouds, &shop, &f, &text).await;
+        println!("{}", serde_json::to_string_pretty(&card).unwrap_or_default());
+        return Ok(());
     }
 
     let warp_ours = if warp::installed() {
@@ -654,7 +743,7 @@ async fn main() -> Result<()> {
         cloud_q: Queue::default(),
         local_q: Queue::default(),
         in_flight: HashSet::new(),
-        cloud_off: vec![None; clouds.len()],
+        cloud_off: vec![None; cloud_count],
         stats: (0, 0),
         local,
     }));
@@ -662,7 +751,6 @@ async fn main() -> Result<()> {
     for i in (1..=LOCAL_WORKERS).filter(|_| local) {
         tokio::spawn(local_worker(state.clone(), cdp.clone(), wake.clone(), i));
     }
-    let clouds: Clouds = Arc::new(clouds.into_iter().map(|c| (c.clone(), Arc::new(std::sync::Mutex::new(c.usage(&data))))).collect());
     for (rank, (c, usage)) in clouds.iter().enumerate() {
         println!("☁ {}", usage.lock().unwrap().line(c.name()));
         for _ in 0..c.pace().workers {
@@ -768,7 +856,7 @@ async fn main() -> Result<()> {
                     if ctx["auxData"]["isDefault"] == true {
                         let id = cdp.next.fetch_add(1, Ordering::Relaxed);
                         let msg = json!({"id": id, "method": "Runtime.evaluate", "sessionId": s,
-                            "params": {"expression": format!("if(!window.__tbtr){{{INJECT}}}"), "contextId": cid}});
+                            "params": {"expression": format!("if(!window.__tbtr){{{}}}", script()), "contextId": cid}});
                         let _ = cdp.tx.send(Message::Text(msg.to_string()));
                     }
                 }
@@ -776,6 +864,12 @@ async fn main() -> Result<()> {
             "Runtime.bindingCalled" if ev["params"]["name"] == "__tbtr_send" => {
                 if let (Some(s), Some(p)) = (ev["sessionId"].as_str(), ev["params"]["payload"].as_str()) {
                     match serde_json::from_str::<Value>(p) {
+                        Ok(v) if v["item"].is_object() => {
+                            let (cdp, clouds, shop, s) = (cdp.clone(), clouds.clone(), shop.clone(), s.to_string());
+                            let url = v["item"]["url"].as_str().unwrap_or("").to_string();
+                            let text = v["item"]["text"].as_str().unwrap_or("").to_string();
+                            tokio::spawn(async move { on_item(&cdp, &clouds, &shop, &s, url, text).await });
+                        }
                         Ok(v) if v["search"].is_string() => {
                             let (state, cdp, clouds, s) = (state.clone(), cdp.clone(), clouds.clone(), s.to_string());
                             let id = v["id"].as_u64().unwrap_or(0);

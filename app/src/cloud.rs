@@ -90,17 +90,19 @@ fn price(model: &str) -> (f64, f64) {
     }
 }
 
-fn claude_body(model: &str, system: &str, user: &str, keys: &[String]) -> Value {
+pub fn strings_schema(keys: &[String]) -> Value {
     let props: serde_json::Map<String, Value> = keys.iter().map(|k| (k.clone(), json!({"type": "string"}))).collect();
+    json!({"type": "object", "properties": props, "required": keys, "additionalProperties": false})
+}
+
+fn claude_body(model: &str, system: &str, user: &str, schema: Value) -> Value {
     json!({
         "model": model,
         "max_tokens": 8000,
         "system": system,
         "output_config": {
             "effort": "low",
-            "format": {"type": "json_schema", "schema": {
-                "type": "object", "properties": props, "required": keys, "additionalProperties": false
-            }}
+            "format": {"type": "json_schema", "schema": schema}
         },
         "messages": [{"role": "user", "content": user}]
     })
@@ -199,15 +201,18 @@ impl Claude {
     }
 
     async fn translate(&self, system: &str, items: &[String]) -> std::result::Result<Done, CloudErr> {
-        let v = self.call(&claude_body(self.model, system, &numbered(items), &line_keys(items.len()))).await?;
+        let v = self.call(&claude_body(self.model, system, &numbered(items), strings_schema(&line_keys(items.len())))).await?;
         claude_parse(self.model, &v, items.len()).map_err(CloudErr::Other)
     }
 
     pub async fn search(&self, ru: &str) -> std::result::Result<(SearchQuery, f64), CloudErr> {
-        let keys = ["q".to_string(), "ru".to_string()];
-        let v = self.call(&claude_body(self.model, SEARCH_PROMPT, ru, &keys)).await?;
-        let (o, usd) = claude_object(self.model, &v).map_err(CloudErr::Other)?;
+        let (o, usd) = self.ask(SEARCH_PROMPT, ru, strings_schema(&["q".to_string(), "ru".to_string()])).await?;
         Ok((search_parse(&o).map_err(CloudErr::Other)?, usd))
+    }
+
+    pub async fn ask(&self, system: &str, user: &str, schema: Value) -> std::result::Result<(Value, f64), CloudErr> {
+        let v = self.call(&claude_body(self.model, system, user, schema)).await?;
+        claude_object(self.model, &v).map_err(CloudErr::Other)
     }
 }
 
@@ -329,15 +334,8 @@ fn day_at(secs: i64, offset_h: i64) -> u64 {
 }
 
 fn month_of(day: u64) -> u32 {
-    let z = day as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
-    (y * 100 + m) as u32
+    let (y, m, _) = crate::money::civil(day);
+    y as u32 * 100 + m
 }
 
 impl Usage {
@@ -429,7 +427,7 @@ mod tests {
     #[test]
     fn body_asks_for_one_required_key_per_line() {
         let items = ["删除".to_string(), "宝贝".to_string()];
-        let b = claude_body("claude-haiku-5-5", "sys", &numbered(&items), &line_keys(items.len()));
+        let b = claude_body("claude-haiku-5-5", "sys", &numbered(&items), strings_schema(&line_keys(items.len())));
         assert_eq!(b["output_config"]["format"]["schema"]["required"], json!(["1", "2"]));
         assert_eq!(b["messages"][0]["content"], json!(r#"{"1":"删除","2":"宝贝"}"#));
         assert!(b.get("temperature").is_none(), "sampling params are rejected on Haiku 5.5");
