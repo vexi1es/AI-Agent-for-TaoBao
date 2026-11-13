@@ -23,4 +23,4 @@ Taobao Desktop in Russian on your own computer. Your account, orders and returns
 1. Taobao Desktop, Cloudflare WARP, an NVIDIA GPU.
 2. `bin/llama/` with a CUDA build of llama.cpp, `models/Hunyuan-MT-7B.Q4_K_M.gguf`.
 3. API keys, one per file: `data/claude.key`, `data/gemini.key` (both optional).
-4. Run `Запуск Taobao на русском.bat`.
+4. Run `Запуск Taobao на русском.bat` (cloud only, GPU stays free; personal pages use the dictionary only) or `Запуск Taobao на русском + RTX.bat` (adds Hunyuan-MT on the GPU).

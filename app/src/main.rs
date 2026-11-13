@@ -114,6 +114,24 @@ struct State {
     in_flight: HashSet<String>,
     cloud_off: Vec<Option<Instant>>,
     stats: (usize, usize),
+    local: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum Route {
+    Cloud,
+    Local,
+    DraftOnly,
+}
+
+fn route(private: bool, cloud: bool, local: bool) -> Route {
+    if !private && cloud {
+        Route::Cloud
+    } else if local {
+        Route::Local
+    } else {
+        Route::DraftOnly
+    }
 }
 
 impl State {
@@ -185,7 +203,7 @@ async fn on_request(state: &Shared, cdp: &Arc<Cdp>, wake: &Arc<Notify>, session:
     let mut drafts = HashMap::new();
     let mut st = state.lock().await;
     let private = st.private_sessions.contains(session);
-    let to_cloud = !private && st.cloud_available();
+    let way = route(private, st.cloud_available(), st.local);
     let mut added = false;
     for (list, high) in [("hi", true), ("lo", false)] {
         for s in v[list].as_array().into_iter().flatten().filter_map(|x| x.as_str()) {
@@ -204,10 +222,10 @@ async fn on_request(state: &Shared, cdp: &Arc<Cdp>, wake: &Arc<Notify>, session:
                     if st.in_flight.contains(s) {
                         continue;
                     }
-                    if to_cloud {
-                        st.cloud_q.push(s, high);
-                    } else {
-                        st.local_q.push(s, high);
+                    match way {
+                        Route::Cloud => st.cloud_q.push(s, high),
+                        Route::Local => st.local_q.push(s, high),
+                        Route::DraftOnly => continue,
                     }
                     added = true;
                 }
@@ -315,24 +333,33 @@ async fn cloud_worker(state: Shared, cdp: Arc<Cdp>, wake: Arc<Notify>, cloud: Ar
                         tokio::time::sleep(pace.busy_wait).await;
                         continue;
                     }
-                    CloudErr::Off(msg) => {
+                    CloudErr::Off(ref msg) => {
                         let pause = match &*cloud {
                             Cloud::Gemini(_) => usage.lock().unwrap().until_reset() + Duration::from_secs(120),
                             Cloud::Claude(_) => Duration::from_secs(1800),
                         };
                         st.cloud_off[rank] = Some(Instant::now() + pause);
-                        let next = st.active_cloud().map_or("RTX".to_string(), |_| "запасное облако".to_string());
-                        println!("☁ {} выключен на {} мин, дальше переводит {next}. Ответ: {}", cloud.name(), pause.as_secs() / 60, cut(&msg, 120));
+                        let next = match route(false, st.cloud_available(), st.local) {
+                            Route::Cloud => "запасное облако",
+                            Route::Local => "RTX",
+                            Route::DraftOnly => "только словарь",
+                        };
+                        println!("☁ {} выключен на {} мин, дальше переводит {next}. Ответ: {}", cloud.name(), pause.as_secs() / 60, cut(msg, 120));
                     }
-                    CloudErr::Other(err) => {
-                        println!("☁ {}: ошибка, эту пачку переведёт RTX: {}", cloud.name(), cut(&err.to_string(), 120));
+                    CloudErr::Other(ref err) => {
+                        println!("☁ {}: ошибка, пачка {}: {}", cloud.name(), if st.local { "уйдёт на RTX" } else { "останется по словарю" }, cut(&err.to_string(), 120));
                     }
                 }
+                let retry_cloud = matches!(e, CloudErr::Off(_)) && st.cloud_available();
                 for s in batch {
                     st.in_flight.remove(&s);
-                    st.local_q.push(&s, true);
+                    match route(false, retry_cloud, st.local) {
+                        Route::Cloud => st.cloud_q.push(&s, true),
+                        Route::Local => st.local_q.push(&s, true),
+                        Route::DraftOnly => {}
+                    }
                 }
-                if !st.cloud_available() {
+                if !st.cloud_available() && st.local {
                     let rest = st.cloud_q.pick_batch(usize::MAX);
                     for s in rest {
                         st.local_q.push(&s, false);
@@ -408,8 +435,10 @@ async fn on_search(state: &Shared, cdp: &Arc<Cdp>, clouds: &Clouds, session: &st
                 }
                 None => None,
             };
+            let local = state.lock().await.local;
             let q = match q {
                 Some(q) => Some((q, "Claude")),
+                None if !local => None,
                 None => {
                     let (http, url) = state.lock().await.tr.client();
                     let prompt = format!("把下面的文本翻译成中文，不要额外解释。\n\n{ru}");
@@ -567,6 +596,11 @@ async fn main() -> Result<()> {
     let tr = Translator::load(&data, &format!("http://127.0.0.1:{MODEL_PORT}/v1/chat/completions"))?;
     println!("Словарь и кэш: {} готовых переводов", tr.cache.len());
 
+    let local = !std::env::args().any(|a| a == "--no-local");
+    println!(
+        "Режим: {}",
+        if local { "облако + RTX (личные страницы переводит RTX)" } else { "лёгкий, без локальной модели (личные страницы — только словарь)" }
+    );
     let mut clouds: Vec<Arc<Cloud>> = Vec::new();
     if let Some(k) = cloud::read_key(&data, "claude.key") {
         clouds.push(Arc::new(Cloud::Claude(Claude::new(k)?)));
@@ -578,7 +612,7 @@ async fn main() -> Result<()> {
         }
     }
     if clouds.is_empty() {
-        println!("Облако: нет ключей в data\\claude.key и data\\gemini.key — всё переводит RTX.");
+        println!("Облако: нет ключей в data\\claude.key и data\\gemini.key — {}.", if local { "всё переводит RTX" } else { "работает только словарь" });
     }
     for (i, c) in clouds.iter().enumerate() {
         let role = if i == 0 { "основное" } else { "запасное" };
@@ -595,7 +629,9 @@ async fn main() -> Result<()> {
         false
     };
     let exit = Arc::new(Exit { warp_ours, llama: std::sync::Mutex::new(None) });
-    *exit.llama.lock().unwrap() = ensure_model(&root).await?;
+    if local {
+        *exit.llama.lock().unwrap() = ensure_model(&root).await?;
+    }
     let ws_url = ensure_taobao().await?;
 
     let (ws, _) = tokio_tungstenite::connect_async(&ws_url).await.context("devtools")?;
@@ -620,9 +656,10 @@ async fn main() -> Result<()> {
         in_flight: HashSet::new(),
         cloud_off: vec![None; clouds.len()],
         stats: (0, 0),
+        local,
     }));
     let wake = Arc::new(Notify::new());
-    for i in 1..=LOCAL_WORKERS {
+    for i in (1..=LOCAL_WORKERS).filter(|_| local) {
         tokio::spawn(local_worker(state.clone(), cdp.clone(), wake.clone(), i));
     }
     let clouds: Clouds = Arc::new(clouds.into_iter().map(|c| (c.clone(), Arc::new(std::sync::Mutex::new(c.usage(&data))))).collect());
@@ -754,4 +791,22 @@ async fn main() -> Result<()> {
     }
     state.lock().await.tr.save();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_text_never_goes_to_the_cloud() {
+        assert_eq!(route(true, true, true), Route::Local);
+        assert_eq!(route(true, true, false), Route::DraftOnly);
+    }
+
+    #[test]
+    fn without_local_model_text_waits_for_the_cloud_or_stays_a_draft() {
+        assert_eq!(route(false, true, false), Route::Cloud);
+        assert_eq!(route(false, false, false), Route::DraftOnly);
+        assert_eq!(route(false, false, true), Route::Local);
+    }
 }
