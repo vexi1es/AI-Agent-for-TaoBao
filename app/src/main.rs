@@ -212,64 +212,208 @@ fn cut(s: &str, n: usize) -> String {
     if s.chars().count() > n { c + "…" } else { c }
 }
 
-async fn on_request(state: &Shared, cdp: &Arc<Cdp>, wake: &Arc<Notify>, session: &str, payload: &str) {
-    let Ok(v) = serde_json::from_str::<Value>(payload) else { return };
-    let mut ready = HashMap::new();
-    let mut drafts = HashMap::new();
-    let mut st = state.lock().await;
-    let private = st.private_sessions.contains(session);
-    let way = route(private, st.cloud_available(), st.local);
-    let mut added = false;
-    for (list, high) in [("hi", true), ("lo", false)] {
-        for s in v[list].as_array().into_iter().flatten().filter_map(|x| x.as_str()) {
-            match st.tr.fast(s) {
-                Hit::Fast(t) => {
-                    ready.insert(s.to_string(), t);
-                }
-                Hit::Miss => {
-                    if let Some(d) = st.tr.draft(s) {
-                        drafts.insert(s.to_string(), d);
+#[derive(Default, Debug, PartialEq)]
+struct Asked {
+    ready: HashMap<String, String>,
+    drafts: HashMap<String, String>,
+    queued: bool,
+}
+
+enum After {
+    Wait(Duration),
+    Next,
+}
+
+impl State {
+    fn new(tr: Translator, clouds: usize, local: bool) -> Self {
+        Self {
+            tr,
+            subs: HashMap::new(),
+            private_sessions: HashSet::new(),
+            private_strs: HashSet::new(),
+            target_session: HashMap::new(),
+            cloud_q: Queue::default(),
+            local_q: Queue::default(),
+            in_flight: HashSet::new(),
+            cloud_off: vec![None; clouds],
+            stats: (0, 0),
+            local,
+        }
+    }
+
+    fn ask(&mut self, session: &str, v: &Value) -> Asked {
+        let private = self.private_sessions.contains(session);
+        let way = route(private, self.cloud_available(), self.local);
+        let mut out = Asked::default();
+        for (list, high) in [("hi", true), ("lo", false)] {
+            for s in v[list].as_array().into_iter().flatten().filter_map(|x| x.as_str()) {
+                match self.tr.fast(s) {
+                    Hit::Fast(t) => {
+                        out.ready.insert(s.to_string(), t);
                     }
-                    st.subs.entry(s.to_string()).or_default().insert(session.to_string());
-                    if private {
-                        st.private_strs.insert(s.to_string());
-                    }
-                    if st.in_flight.contains(s) {
-                        continue;
-                    }
-                    match way {
-                        Route::Cloud => st.cloud_q.push(s, high),
-                        Route::Local => st.local_q.push(s, high),
-                        Route::DraftOnly => continue,
-                    }
-                    added = true;
+                    Hit::Miss => out.queued |= self.miss(session, s, private, &way, high, &mut out.drafts),
                 }
             }
         }
+        out
     }
-    drop(st);
-    cdp.apply(session, &ready);
-    cdp.draft(session, &drafts);
-    if added {
+
+    fn miss(&mut self, session: &str, s: &str, private: bool, way: &Route, high: bool, drafts: &mut HashMap<String, String>) -> bool {
+        if let Some(d) = self.tr.draft(s) {
+            drafts.insert(s.to_string(), d);
+        }
+        self.subs.entry(s.to_string()).or_default().insert(session.to_string());
+        if private {
+            self.private_strs.insert(s.to_string());
+        }
+        if self.in_flight.contains(s) {
+            return false;
+        }
+        match way {
+            Route::Cloud => self.cloud_q.push(s, high),
+            Route::Local => self.local_q.push(s, high),
+            Route::DraftOnly => return false,
+        }
+        true
+    }
+
+    fn done(&mut self, results: &[(String, String)], ms: u128, src: &str) -> HashMap<String, HashMap<String, String>> {
+        let mut per_session: HashMap<String, HashMap<String, String>> = HashMap::new();
+        for (zh, ru) in results {
+            self.tr.remember(zh, ru, ms, src);
+            self.in_flight.remove(zh);
+            for s in self.subs.remove(zh).unwrap_or_default() {
+                per_session.entry(s).or_default().insert(zh.clone(), ru.clone());
+            }
+        }
+        if src == "cloud" {
+            self.stats.0 += results.len()
+        } else {
+            self.stats.1 += results.len()
+        }
+        per_session
+    }
+
+    fn steal_local(&mut self, max: usize) {
+        for high in [true, false] {
+            let from = if high { &mut self.local_q.hi } else { &mut self.local_q.lo };
+            let (take, keep): (Vec<String>, Vec<String>) = std::mem::take(from).into_iter().partition(|x| !self.private_strs.contains(x));
+            let room = max.saturating_sub(self.cloud_q.len());
+            let (now, later) = take.split_at(take.len().min(room));
+            let from = if high { &mut self.local_q.hi } else { &mut self.local_q.lo };
+            from.extend(later.iter().cloned().chain(keep));
+            for x in now {
+                self.cloud_q.push(x, high);
+            }
+        }
+    }
+
+    fn cloud_batch(&mut self, rank: usize, size: usize) -> Option<(Vec<String>, Vec<(String, String)>)> {
+        if self.active_cloud() != Some(rank) {
+            return None;
+        }
+        if self.cloud_q.len() == 0 {
+            self.steal_local(size);
+        }
+        let b: Vec<String> = self.cloud_q.pick_batch(size).into_iter().filter(|s| matches!(self.tr.fast(s), Hit::Miss)).collect();
+        if b.is_empty() {
+            return None;
+        }
+        self.in_flight.extend(b.iter().cloned());
+        let terms = self.tr.terms_for(&b);
+        Some((b, terms))
+    }
+
+    fn cloud_failed(&mut self, rank: usize, batch: Vec<String>, err: &CloudErr, pause: Duration, busy_wait: Duration) -> After {
+        match err {
+            CloudErr::Busy => {
+                self.requeue_front(batch);
+                After::Wait(busy_wait)
+            }
+            CloudErr::Off(_) => {
+                self.cloud_off[rank] = Some(Instant::now() + pause);
+                self.hand_over(batch, self.cloud_available());
+                After::Next
+            }
+            CloudErr::Other(_) => {
+                self.hand_over(batch, false);
+                After::Next
+            }
+        }
+    }
+
+    fn requeue_front(&mut self, batch: Vec<String>) {
+        for s in batch.into_iter().rev() {
+            self.in_flight.remove(&s);
+            self.cloud_q.hi.push_front(s);
+        }
+    }
+
+    fn hand_over(&mut self, batch: Vec<String>, retry_cloud: bool) {
+        for s in batch {
+            self.in_flight.remove(&s);
+            match route(false, retry_cloud, self.local) {
+                Route::Cloud => self.cloud_q.push(&s, true),
+                Route::Local => self.local_q.push(&s, true),
+                Route::DraftOnly => {}
+            }
+        }
+        if !self.cloud_available() && self.local {
+            for s in self.cloud_q.pick_batch(usize::MAX) {
+                self.local_q.push(&s, false);
+            }
+        }
+    }
+
+    fn next_route_name(&self) -> &'static str {
+        match route(false, self.cloud_available(), self.local) {
+            Route::Cloud => "запасное облако",
+            Route::Local => "RTX",
+            Route::DraftOnly => "только словарь",
+        }
+    }
+
+    fn local_job(&mut self) -> Option<String> {
+        while let Some(s) = self.local_q.pick_one() {
+            if !self.tr.cache.contains_key(&s) && !self.in_flight.contains(&s) {
+                self.in_flight.insert(s.clone());
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    fn local_failed(&mut self, zh: &str) {
+        self.in_flight.remove(zh);
+        self.local_q.push(zh, false);
+    }
+}
+
+async fn on_request(state: &Shared, cdp: &Arc<Cdp>, wake: &Arc<Notify>, session: &str, payload: &str) {
+    let Ok(v) = serde_json::from_str::<Value>(payload) else { return };
+    let asked = state.lock().await.ask(session, &v);
+    cdp.apply(session, &asked.ready);
+    cdp.draft(session, &asked.drafts);
+    if asked.queued {
         wake.notify_waiters();
     }
 }
 
 async fn deliver(state: &Shared, cdp: &Arc<Cdp>, results: Vec<(String, String)>, ms: u128, src: &str) {
-    let mut per_session: HashMap<String, HashMap<String, String>> = HashMap::new();
-    {
-        let mut st = state.lock().await;
-        for (zh, ru) in &results {
-            st.tr.remember(zh, ru, ms, src);
-            st.in_flight.remove(zh);
-            for s in st.subs.remove(zh).unwrap_or_default() {
-                per_session.entry(s).or_default().insert(zh.clone(), ru.clone());
-            }
-        }
-        if src == "cloud" { st.stats.0 += results.len() } else { st.stats.1 += results.len() }
-    }
+    let per_session = state.lock().await.done(&results, ms, src);
     for (s, map) in per_session {
         cdp.apply(&s, &map);
+    }
+}
+
+async fn idle(wake: &Notify) {
+    let _ = tokio::time::timeout(Duration::from_millis(500), wake.notified()).await;
+}
+
+fn off_pause(cloud: &Cloud, usage: &std::sync::Mutex<Usage>) -> Duration {
+    match cloud {
+        Cloud::Gemini(_) => usage.lock().unwrap().until_reset() + Duration::from_secs(120),
+        Cloud::Claude(_) => Duration::from_secs(1800),
     }
 }
 
@@ -277,113 +421,46 @@ async fn cloud_worker(state: Shared, cdp: Arc<Cdp>, wake: Arc<Notify>, cloud: Ar
     let pace = cloud.pace();
     let mut last = Instant::now() - pace.gap;
     loop {
-        let batch = {
-            let mut st = state.lock().await;
-            if st.active_cloud() != Some(rank) {
-                None
-            } else {
-                if st.cloud_q.len() == 0 && st.local_q.len() > 0 {
-                    let st = &mut *st;
-                    for (from, high) in [(&mut st.local_q.hi, true), (&mut st.local_q.lo, false)] {
-                        let mut keep = VecDeque::new();
-                        while let Some(x) = from.pop_front() {
-                            if st.cloud_q.len() < pace.batch && !st.private_strs.contains(&x) {
-                                st.cloud_q.push(&x, high);
-                            } else {
-                                keep.push_back(x);
-                            }
-                        }
-                        *from = keep;
-                    }
-                }
-                let b: Vec<String> = st.cloud_q.pick_batch(pace.batch).into_iter().filter(|s| matches!(st.tr.fast(s), Hit::Miss)).collect();
-                if b.is_empty() {
-                    None
-                } else {
-                    for s in &b {
-                        st.in_flight.insert(s.clone());
-                    }
-                    let terms = st.tr.terms_for(&b);
-                    Some((b, terms))
-                }
-            }
-        };
-        let Some((batch, terms)) = batch else {
-            let _ = tokio::time::timeout(Duration::from_millis(500), wake.notified()).await;
-            tokio::time::sleep(Duration::from_millis(150)).await;
+        let Some((batch, terms)) = state.lock().await.cloud_batch(rank, pace.batch) else {
+            idle(&wake).await;
             continue;
         };
-        let wait = pace.gap.saturating_sub(last.elapsed());
-        if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
-        }
+        tokio::time::sleep(pace.gap.saturating_sub(last.elapsed())).await;
         last = Instant::now();
-        let t = Instant::now();
         usage.lock().unwrap().add(batch.len());
         match cloud.translate(&batch, &terms).await {
-            Ok(done) => {
-                let ms = t.elapsed().as_millis();
-                let line = {
-                    let mut u = usage.lock().unwrap();
-                    u.spend(done.usd);
-                    u.line(cloud.name())
-                };
-                let left = state.lock().await.cloud_q.len();
-                println!("☁ {:>5}ms {:>2} строк  {line} (в очереди {left})   напр.: {} → {}", ms, batch.len(), cut(&batch[0], 16), cut(&done.lines[0], 36));
-                let res: Vec<(String, String)> = batch.into_iter().zip(done.lines).map(|(z, r)| (z, r.trim().to_string())).collect();
-                deliver(&state, &cdp, res, ms, "cloud").await;
-            }
+            Ok(done) => cloud_done(&state, &cdp, &cloud, &usage, batch, done, last.elapsed().as_millis()).await,
             Err(e) => {
-                let mut st = state.lock().await;
-                match e {
-                    CloudErr::Busy => {
-                        for s in batch.iter().rev() {
-                            st.in_flight.remove(s);
-                            st.cloud_q.hi.push_front(s.clone());
-                        }
-                        drop(st);
-                        if pace.busy_wait >= Duration::from_secs(5) {
-                            println!("☁ {} занят, подожду…", cloud.name());
-                        }
-                        tokio::time::sleep(pace.busy_wait).await;
-                        continue;
-                    }
-                    CloudErr::Off(ref msg) => {
-                        let pause = match &*cloud {
-                            Cloud::Gemini(_) => usage.lock().unwrap().until_reset() + Duration::from_secs(120),
-                            Cloud::Claude(_) => Duration::from_secs(1800),
-                        };
-                        st.cloud_off[rank] = Some(Instant::now() + pause);
-                        let next = match route(false, st.cloud_available(), st.local) {
-                            Route::Cloud => "запасное облако",
-                            Route::Local => "RTX",
-                            Route::DraftOnly => "только словарь",
-                        };
-                        println!("☁ {} выключен на {} мин, дальше переводит {next}. Ответ: {}", cloud.name(), pause.as_secs() / 60, cut(msg, 120));
-                    }
-                    CloudErr::Other(ref err) => {
-                        println!("☁ {}: ошибка, пачка {}: {}", cloud.name(), if st.local { "уйдёт на RTX" } else { "останется по словарю" }, cut(&err.to_string(), 120));
-                    }
-                }
-                let retry_cloud = matches!(e, CloudErr::Off(_)) && st.cloud_available();
-                for s in batch {
-                    st.in_flight.remove(&s);
-                    match route(false, retry_cloud, st.local) {
-                        Route::Cloud => st.cloud_q.push(&s, true),
-                        Route::Local => st.local_q.push(&s, true),
-                        Route::DraftOnly => {}
-                    }
-                }
-                if !st.cloud_available() && st.local {
-                    let rest = st.cloud_q.pick_batch(usize::MAX);
-                    for s in rest {
-                        st.local_q.push(&s, false);
-                    }
-                }
-                drop(st);
+                let pause = off_pause(&cloud, &usage);
+                let after = state.lock().await.cloud_failed(rank, batch, &e, pause, pace.busy_wait);
+                report_failure(&state, &cloud, &e, pause).await;
                 wake.notify_waiters();
+                if let After::Wait(d) = after {
+                    tokio::time::sleep(d).await;
+                }
             }
         }
+    }
+}
+
+async fn cloud_done(state: &Shared, cdp: &Arc<Cdp>, cloud: &Cloud, usage: &std::sync::Mutex<Usage>, batch: Vec<String>, done: cloud::Done, ms: u128) {
+    let line = {
+        let mut u = usage.lock().unwrap();
+        u.spend(done.usd);
+        u.line(cloud.name())
+    };
+    let left = state.lock().await.cloud_q.len();
+    println!("☁ {:>5}ms {:>2} строк  {line} (в очереди {left})   напр.: {} → {}", ms, batch.len(), cut(&batch[0], 16), cut(&done.lines[0], 36));
+    let res: Vec<(String, String)> = batch.into_iter().zip(done.lines).map(|(z, r)| (z, r.trim().to_string())).collect();
+    deliver(state, cdp, res, ms, "cloud").await;
+}
+
+async fn report_failure(state: &Shared, cloud: &Cloud, e: &CloudErr, pause: Duration) {
+    let st = state.lock().await;
+    match e {
+        CloudErr::Busy => {}
+        CloudErr::Off(msg) => println!("☁ {} выключен на {} мин, дальше переводит {}. Ответ: {}", cloud.name(), pause.as_secs() / 60, st.next_route_name(), cut(msg, 120)),
+        CloudErr::Other(err) => println!("☁ {}: ошибка, пачка {}: {}", cloud.name(), if st.local { "уйдёт на RTX" } else { "останется по словарю" }, cut(&err.to_string(), 120)),
     }
 }
 
@@ -391,33 +468,20 @@ async fn local_worker(state: Shared, cdp: Arc<Cdp>, wake: Arc<Notify>, id: usize
     loop {
         let job = {
             let mut st = state.lock().await;
-            loop {
-                match st.local_q.pick_one() {
-                    Some(s) if st.tr.cache.contains_key(&s) || st.in_flight.contains(&s) => continue,
-                    Some(s) => {
-                        st.in_flight.insert(s.clone());
-                        break Some((st.tr.prompt(&s), st.tr.client(), s));
-                    }
-                    None => break None,
-                }
-            }
+            st.local_job().map(|s| (st.tr.prompt(&s), st.tr.client(), s))
         };
         let Some((prompt, (http, url), zh)) = job else {
-            let _ = tokio::time::timeout(Duration::from_millis(500), wake.notified()).await;
+            idle(&wake).await;
             continue;
         };
         match Translator::model(&http, &url, prompt, &zh).await {
             Ok((ru, ms)) => {
-                let left = state.lock().await.local_q.len();
-                println!("{id}▸{:>5}ms  {} → {}   (RTX, в очереди {left})", ms, cut(&zh, 26), cut(&ru, 50));
+                println!("{id}▸{:>5}ms  {} → {}   (RTX)", ms, cut(&zh, 26), cut(&ru, 50));
                 deliver(&state, &cdp, vec![(zh, ru)], ms, "local").await;
             }
             Err(e) => {
                 eprintln!("[RTX] {e}");
-                let mut st = state.lock().await;
-                st.in_flight.remove(&zh);
-                st.local_q.push(&zh, false);
-                drop(st);
+                state.lock().await.local_failed(&zh);
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
         }
@@ -439,31 +503,43 @@ fn item_key(url: &str) -> String {
         .map_or_else(|| url.split('#').next().unwrap_or(url).to_string(), |c| c[1].to_string())
 }
 
+fn claude_of(clouds: &Clouds) -> Option<(&Arc<Cloud>, &Claude, &Arc<std::sync::Mutex<Usage>>)> {
+    clouds.iter().find_map(|(c, u)| match &**c {
+        Cloud::Claude(cl) => Some((c, cl, u)),
+        Cloud::Gemini(_) => None,
+    })
+}
+
+fn seen_card(shop: &Shop, key: &str, digest: &str) -> Option<Value> {
+    let (len, card) = shop.seen.lock().unwrap().get(key).cloned()?;
+    (digest.len() * 2 <= len * 3).then_some(card)
+}
+
+async fn fix_chinese(cloud: &Cloud, usage: &std::sync::Mutex<Usage>, v: &mut item::Verdict) {
+    let left = v.chinese_left();
+    if left.is_empty() {
+        return;
+    }
+    usage.lock().unwrap().add(left.len());
+    if let Ok(done) = cloud.translate(&left, &[]).await {
+        usage.lock().unwrap().spend(done.usd);
+        v.replace(&left.into_iter().zip(done.lines).collect::<Vec<_>>());
+    }
+}
+
 async fn judge(clouds: &Clouds, shop: &Shop, url: &str, text: &str) -> Option<Value> {
     let key = item_key(url);
     let digest = item::digest(text, 6000);
-    if let Some((len, card)) = shop.seen.lock().unwrap().get(&key).cloned() {
-        if digest.len() * 2 <= len * 3 {
-            return Some(card);
-        }
+    if let Some(card) = seen_card(shop, &key, &digest) {
+        return Some(card);
     }
-    let (cloud, c, usage) = clouds.iter().find_map(|(c, u)| match &**c {
-        Cloud::Claude(cl) => Some((c, cl, u)),
-        Cloud::Gemini(_) => None,
-    })?;
+    let (cloud, c, usage) = claude_of(clouds)?;
     usage.lock().unwrap().add(1);
     let t = Instant::now();
     let (o, usd) = c.ask(item::ITEM_PROMPT, &digest, item::schema()).await.ok()?;
     usage.lock().unwrap().spend(usd);
     let mut v = item::parse_verdict(&o).ok()?;
-    let left = v.chinese_left();
-    if !left.is_empty() {
-        usage.lock().unwrap().add(left.len());
-        if let Ok(done) = cloud.translate(&left, &[]).await {
-            usage.lock().unwrap().spend(done.usd);
-            v.replace(&left.into_iter().zip(done.lines).collect::<Vec<_>>());
-        }
-    }
+    fix_chinese(cloud, usage, &mut v).await;
     let card = item::card(&v, shop.rates.as_ref(), &shop.settings);
     println!("🏷 {:>5}ms  {} · {} · {}", t.elapsed().as_millis(), card["label"].as_str().unwrap_or(""), cut(&v.why, 50), card["total"].as_str().unwrap_or(""));
     shop.seen.lock().unwrap().insert(key, (digest.len(), card.clone()));
@@ -475,57 +551,58 @@ async fn on_item(cdp: &Arc<Cdp>, clouds: &Clouds, shop: &Shop, session: &str, ur
     cdp.eval(session, format!("window.__tbtr_item_done&&window.__tbtr_item_done({card})"));
 }
 
+type Found = (String, String, &'static str);
+
+async fn search_claude(state: &Shared, clouds: &Clouds, ru: &str) -> Option<Found> {
+    let i = state.lock().await.active_cloud()?;
+    let (cloud, usage) = &clouds[i];
+    let Cloud::Claude(c) = &**cloud else { return None };
+    usage.lock().unwrap().add(1);
+    let (q, usd) = c.search(ru).await.ok()?;
+    usage.lock().unwrap().spend(usd);
+    Some((q.zh, q.ru, "Claude"))
+}
+
+async fn search_local(state: &Shared, ru: &str) -> Option<Found> {
+    let (local, (http, url)) = {
+        let st = state.lock().await;
+        (st.local, st.tr.client())
+    };
+    if !local {
+        return None;
+    }
+    let prompt = format!("把下面的文本翻译成中文，不要额外解释。\n\n{ru}");
+    let (zh, _) = Translator::model(&http, &url, prompt, ru).await.ok()?;
+    Some((zh, ru.to_string(), "RTX"))
+}
+
+async fn search_query(state: &Shared, clouds: &Clouds, ru: &str) -> Option<Found> {
+    if let Some((zh, m)) = state.lock().await.tr.search_cached(ru) {
+        return Some((zh, m, "кэш"));
+    }
+    let found = match search_claude(state, clouds, ru).await {
+        Some(f) => Some(f),
+        None => search_local(state, ru).await,
+    };
+    if let Some((zh, m, _)) = &found {
+        state.lock().await.tr.remember_search(ru, zh, m);
+    }
+    found
+}
+
+fn search_reply(id: u64, found: Option<&Found>) -> String {
+    let (zh, m) = found.map_or((Value::Null, Value::Null), |(zh, m, _)| (json!(zh), json!(m)));
+    format!("window.__tbtr_search_done&&window.__tbtr_search_done({id},{zh},{m})")
+}
+
 async fn on_search(state: &Shared, cdp: &Arc<Cdp>, clouds: &Clouds, session: &str, id: u64, ru: String) {
     let t = Instant::now();
-    let known = state.lock().await.tr.search_cached(&ru);
-    let found = match known {
-        Some(q) => Some((q, "кэш")),
-        None => {
-            let active = state.lock().await.active_cloud();
-            let claude = active.and_then(|i| match &*clouds[i].0 {
-                Cloud::Claude(c) => Some((c, &clouds[i].1)),
-                Cloud::Gemini(_) => None,
-            });
-            let q = match claude {
-                Some((c, usage)) => {
-                    usage.lock().unwrap().add(1);
-                    match c.search(&ru).await {
-                        Ok((q, usd)) => {
-                            usage.lock().unwrap().spend(usd);
-                            Some((q.zh, q.ru))
-                        }
-                        Err(_) => None,
-                    }
-                }
-                None => None,
-            };
-            let local = state.lock().await.local;
-            let q = match q {
-                Some(q) => Some((q, "Claude")),
-                None if !local => None,
-                None => {
-                    let (http, url) = state.lock().await.tr.client();
-                    let prompt = format!("把下面的文本翻译成中文，不要额外解释。\n\n{ru}");
-                    Translator::model(&http, &url, prompt, &ru).await.ok().map(|(zh, _)| ((zh, ru.clone()), "RTX"))
-                }
-            };
-            if let Some(((zh, meaning), _)) = &q {
-                state.lock().await.tr.remember_search(&ru, zh, meaning);
-            }
-            q
-        }
-    };
-    let (zh, meaning) = match &found {
-        Some(((zh, m), src)) => {
-            println!("🔍 {:>5}ms  {} → {} ({m}) [{src}]", t.elapsed().as_millis(), cut(&ru, 30), zh);
-            (json!(zh), json!(m))
-        }
-        None => {
-            println!("🔍 не получилось перевести «{}» — ищу как написано", cut(&ru, 30));
-            (Value::Null, Value::Null)
-        }
-    };
-    cdp.eval(session, format!("window.__tbtr_search_done&&window.__tbtr_search_done({id},{zh},{meaning})"));
+    let found = search_query(state, clouds, &ru).await;
+    match &found {
+        Some((zh, m, src)) => println!("🔍 {:>5}ms  {} → {} ({m}) [{src}]", t.elapsed().as_millis(), cut(&ru, 30), zh),
+        None => println!("🔍 не получилось перевести «{}» — ищу как написано", cut(&ru, 30)),
+    }
+    cdp.eval(session, search_reply(id, found.as_ref()));
 }
 
 struct Exit {
@@ -644,87 +721,241 @@ fn find_root() -> PathBuf {
     r"D:\All\taobao-translator".into()
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let judge_file = args.windows(2).find(|w| w[0] == "--judge-file").map(|w| w[1].clone());
-    let _single = match (&judge_file, std::net::TcpListener::bind("127.0.0.1:9339")) {
-        (Some(_), _) => None,
-        (None, Ok(l)) => Some(l),
-        (None, Err(_)) => {
-            println!("Переводчик уже запущен в другом окне.");
-            return Ok(());
-        }
-    };
-    let root = find_root();
-    let data = root.join("data");
-    println!("Taobao → русский. Папка: {}", root.display());
+#[derive(Debug, PartialEq)]
+struct Args {
+    judge_file: Option<String>,
+    local: bool,
+}
 
-    let tr = Translator::load(&data, &format!("http://127.0.0.1:{MODEL_PORT}/v1/chat/completions"))?;
-    println!("Словарь и кэш: {} готовых переводов", tr.cache.len());
-
-    let local = !args.iter().any(|a| a == "--no-local");
-    println!(
-        "Режим: {}",
-        if local { "облако + RTX (личные страницы переводит RTX)" } else { "лёгкий, без локальной модели (личные страницы — только словарь)" }
-    );
-    let mut clouds: Vec<Arc<Cloud>> = Vec::new();
-    if let Some(k) = cloud::read_key(&data, "claude.key") {
-        clouds.push(Arc::new(Cloud::Claude(Claude::new(k)?)));
-    }
-    if let Some(k) = cloud::read_key(&data, "gemini.key") {
-        match Gemini::connect(k).await {
-            Ok(g) => clouds.push(Arc::new(Cloud::Gemini(g))),
-            Err(e) => println!("Gemini недоступен ({e})."),
+impl Args {
+    fn parse(args: &[String]) -> Self {
+        Self {
+            judge_file: args.windows(2).find(|w| w[0] == "--judge-file").map(|w| w[1].clone()),
+            local: !args.iter().any(|a| a == "--no-local"),
         }
     }
-    if clouds.is_empty() {
-        println!("Облако: нет ключей в data\\claude.key и data\\gemini.key — {}.", if local { "всё переводит RTX" } else { "работает только словарь" });
-    }
-    for (i, c) in clouds.iter().enumerate() {
-        let role = if i == 0 { "основное" } else { "запасное" };
-        println!("Облако {role}: {} ({}) — тексты и названия, кроме личных страниц.", c.name(), c.model());
-    }
-    let cloud_count = clouds.len();
-    let clouds: Clouds = Arc::new(clouds.into_iter().map(|c| (c.clone(), Arc::new(std::sync::Mutex::new(c.usage(&data))))).collect());
+}
 
-    let settings = money::Settings::load(&data);
-    let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
-    let rates = money::Rates::load(&data, &http).await;
-    match &rates {
-        Some(r) => println!(
-            "Курс ЦБ на {}: 1 ¥ = {:.2} сум, 1 $ = {:.2} сум; наценка ×{}, карго {} ${}/кг.",
-            r.date, r.uzs_per_cny, r.uzs_per_usd, settings.markup, settings.cargo_name, settings.cargo_usd_per_kg
-        ),
-        None => println!("Курс ЦБ недоступен — цены в сумах не показываю."),
-    }
-    let _ = SCRIPT.set(page_config(rates.as_ref(), &settings) + INJECT);
-    let shop = Arc::new(Shop { rates, settings, seen: std::sync::Mutex::new(HashMap::new()) });
+#[derive(Debug, PartialEq)]
+enum PageMsg {
+    Item { url: String, text: String },
+    Search { id: u64, ru: String },
+    Texts,
+}
 
-    if let Some(f) = judge_file {
-        let text = std::fs::read_to_string(&f).with_context(|| f.clone())?;
-        let card = judge(&clouds, &shop, &f, &text).await;
-        println!("{}", serde_json::to_string_pretty(&card).unwrap_or_default());
-        return Ok(());
-    }
-
-    let warp_ours = if warp::installed() {
-        println!("Включаю WARP…");
-        let ours = warp::ensure_on().await?;
-        println!("WARP {}.", if ours { "включён (выключу при выходе)" } else { "уже был включён (оставлю как есть)" });
-        ours
+fn page_msg(payload: &str) -> PageMsg {
+    let v: Value = serde_json::from_str(payload).unwrap_or(Value::Null);
+    let s = |x: &Value| x.as_str().unwrap_or("").to_string();
+    if v["item"].is_object() {
+        PageMsg::Item { url: s(&v["item"]["url"]), text: s(&v["item"]["text"]) }
+    } else if v["search"].is_string() {
+        PageMsg::Search { id: v["id"].as_u64().unwrap_or(0), ru: s(&v["search"]) }
     } else {
-        println!("Cloudflare WARP не найден — запускаю без него.");
-        false
-    };
-    let exit = Arc::new(Exit { warp_ours, llama: std::sync::Mutex::new(None) });
-    if local {
-        *exit.llama.lock().unwrap() = ensure_model(&root).await?;
+        PageMsg::Texts
     }
-    let ws_url = ensure_taobao().await?;
+}
 
-    let (ws, _) = tokio_tungstenite::connect_async(&ws_url).await.context("devtools")?;
-    let (mut sink, mut stream) = ws.split();
+#[derive(Debug, PartialEq)]
+enum Event {
+    Target(Value),
+    Gone(String),
+    NewDocument { session: String, context: i64 },
+    Page { session: String, payload: String },
+    Other,
+}
+
+fn event(ev: &Value) -> Event {
+    let p = &ev["params"];
+    match ev["method"].as_str().unwrap_or("") {
+        "Target.targetCreated" | "Target.targetInfoChanged" => Event::Target(p["targetInfo"].clone()),
+        "Target.targetDestroyed" | "Target.detachedFromTarget" => p["targetId"].as_str().map_or(Event::Other, |id| Event::Gone(id.into())),
+        method => ev["sessionId"].as_str().map_or(Event::Other, |s| session_event(method, s.to_string(), p)),
+    }
+}
+
+fn session_event(method: &str, session: String, p: &Value) -> Event {
+    match method {
+        "Runtime.executionContextCreated" if p["context"]["auxData"]["isDefault"] == true => {
+            p["context"]["id"].as_i64().map_or(Event::Other, |context| Event::NewDocument { session, context })
+        }
+        "Runtime.bindingCalled" if p["name"] == "__tbtr_send" => {
+            p["payload"].as_str().map_or(Event::Other, |payload| Event::Page { session, payload: payload.into() })
+        }
+        _ => Event::Other,
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum TargetChange {
+    Attach { id: String, url: String },
+    Moved { id: String, private: bool },
+    Nothing,
+}
+
+#[derive(Default)]
+struct Targets {
+    attached: HashMap<String, String>,
+}
+
+impl Targets {
+    fn update(&mut self, info: &Value) -> TargetChange {
+        if !wanted(info) {
+            return TargetChange::Nothing;
+        }
+        let id = info["targetId"].as_str().unwrap_or("").to_string();
+        let url = info["url"].as_str().unwrap_or("").to_string();
+        match self.attached.insert(id.clone(), url.clone()) {
+            None => TargetChange::Attach { id, url },
+            Some(old) if old != url => TargetChange::Moved { id, private: is_private(&url) },
+            Some(_) => TargetChange::Nothing,
+        }
+    }
+
+    fn gone(&mut self, id: &str) {
+        self.attached.remove(id);
+    }
+}
+
+impl State {
+    fn moved(&mut self, target: &str, private: bool) {
+        let Some(s) = self.target_session.get(target).cloned() else { return };
+        if private {
+            self.private_sessions.insert(s);
+        } else {
+            self.private_sessions.remove(&s);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct App {
+    state: Shared,
+    cdp: Arc<Cdp>,
+    clouds: Clouds,
+    shop: Arc<Shop>,
+    wake: Arc<Notify>,
+    exit: Arc<Exit>,
+}
+
+impl App {
+    fn attach(&self, id: String, url: String) {
+        let (cdp, state) = (self.cdp.clone(), self.state.clone());
+        tokio::spawn(async move {
+            match cdp.call("Target.attachToTarget", json!({"targetId": &id, "flatten": true}), None).await {
+                Ok(r) => {
+                    if let Some(s) = r["sessionId"].as_str() {
+                        setup_session(cdp.clone(), state, id, s.to_string(), url).await;
+                    }
+                }
+                Err(e) => eprintln!("[!] attach: {e}"),
+            }
+        });
+    }
+
+    async fn target(&self, targets: &mut Targets, info: &Value) {
+        match targets.update(info) {
+            TargetChange::Attach { id, url } => self.attach(id, url),
+            TargetChange::Moved { id, private } => self.state.lock().await.moved(&id, private),
+            TargetChange::Nothing => {}
+        }
+    }
+
+    fn reinject(&self, session: &str, context: i64) {
+        let id = self.cdp.next.fetch_add(1, Ordering::Relaxed);
+        let msg = json!({"id": id, "method": "Runtime.evaluate", "sessionId": session,
+            "params": {"expression": format!("if(!window.__tbtr){{{}}}", script()), "contextId": context}});
+        let _ = self.cdp.tx.send(Message::Text(msg.to_string()));
+    }
+
+    async fn page(&self, session: String, payload: String) {
+        let app = self.clone();
+        match page_msg(&payload) {
+            PageMsg::Item { url, text } => {
+                tokio::spawn(async move { on_item(&app.cdp, &app.clouds, &app.shop, &session, url, text).await });
+            }
+            PageMsg::Search { id, ru } => {
+                tokio::spawn(async move { on_search(&app.state, &app.cdp, &app.clouds, &session, id, ru).await });
+            }
+            PageMsg::Texts => on_request(&self.state, &self.cdp, &self.wake, &session, &payload).await,
+        }
+    }
+
+    async fn handle(&self, targets: &mut Targets, ev: &Value) {
+        match event(ev) {
+            Event::Target(info) => self.target(targets, &info).await,
+            Event::Gone(id) => targets.gone(&id),
+            Event::NewDocument { session, context } => self.reinject(&session, context),
+            Event::Page { session, payload } => self.page(session, payload).await,
+            Event::Other => {}
+        }
+    }
+
+    fn start_workers(&self, local: bool) {
+        for i in (1..=LOCAL_WORKERS).filter(|_| local) {
+            tokio::spawn(local_worker(self.state.clone(), self.cdp.clone(), self.wake.clone(), i));
+        }
+        for (rank, (c, usage)) in self.clouds.iter().enumerate() {
+            println!("☁ {}", usage.lock().unwrap().line(c.name()));
+            for _ in 0..c.pace().workers {
+                tokio::spawn(cloud_worker(self.state.clone(), self.cdp.clone(), self.wake.clone(), c.clone(), rank, usage.clone()));
+            }
+        }
+    }
+
+    fn watch_exit(&self) {
+        let (state, exit) = (self.state.clone(), self.exit.clone());
+        tokio::spawn(async move {
+            let mut close = tokio::signal::windows::ctrl_close().expect("ctrl_close");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = close.recv() => {}
+            }
+            shutdown(&state, &exit, true).await;
+        });
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                state.lock().await.tr.save();
+            }
+        });
+    }
+
+    async fn run(&self, mut events: mpsc::UnboundedReceiver<Value>) -> Result<()> {
+        self.cdp.call("Target.setDiscoverTargets", json!({"discover": true}), None).await?;
+        let initial = self.cdp.call("Target.getTargets", json!({}), None).await?;
+        let mut targets = Targets::default();
+        for info in initial["targetInfos"].as_array().into_iter().flatten() {
+            self.target(&mut targets, info).await;
+        }
+        println!("Перевод включён. Alt+T в окне Taobao — показать оригинал. Закрыть это окно — выключить перевод.");
+        while let Some(ev) = events.recv().await {
+            self.handle(&mut targets, &ev).await;
+        }
+        self.state.lock().await.tr.save();
+        Ok(())
+    }
+}
+
+async fn read_devtools(mut stream: futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>, cdp: Arc<Cdp>, events: mpsc::UnboundedSender<Value>) {
+    while let Some(Ok(m)) = stream.next().await {
+        let Message::Text(t) = m else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&t) else { continue };
+        match v.get("id").and_then(|x| x.as_u64()) {
+            Some(id) => {
+                if let Some(tx) = cdp.pending.lock().await.remove(&id) {
+                    let _ = tx.send(v);
+                }
+            }
+            None if events.send(v).is_err() => break,
+            None => {}
+        }
+    }
+}
+
+async fn connect_devtools(ws_url: &str) -> Result<(Arc<Cdp>, mpsc::UnboundedReceiver<Value>, impl std::future::Future<Output = ()>)> {
+    let (ws, _) = tokio_tungstenite::connect_async(ws_url).await.context("devtools")?;
+    let (mut sink, stream) = ws.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
@@ -734,157 +965,119 @@ async fn main() -> Result<()> {
         }
     });
     let cdp = Arc::new(Cdp { tx, next: AtomicU64::new(1), pending: Mutex::new(HashMap::new()) });
-    let state: Shared = Arc::new(Mutex::new(State {
-        tr,
-        subs: HashMap::new(),
-        private_sessions: HashSet::new(),
-        private_strs: HashSet::new(),
-        target_session: HashMap::new(),
-        cloud_q: Queue::default(),
-        local_q: Queue::default(),
-        in_flight: HashSet::new(),
-        cloud_off: vec![None; cloud_count],
-        stats: (0, 0),
-        local,
-    }));
-    let wake = Arc::new(Notify::new());
-    for i in (1..=LOCAL_WORKERS).filter(|_| local) {
-        tokio::spawn(local_worker(state.clone(), cdp.clone(), wake.clone(), i));
+    let (ev_tx, ev_rx) = mpsc::unbounded_channel::<Value>();
+    let reader = read_devtools(stream, cdp.clone(), ev_tx);
+    Ok((cdp, ev_rx, reader))
+}
+
+async fn load_clouds(data: &Path, local: bool) -> Result<Clouds> {
+    let mut clouds: Vec<Arc<Cloud>> = Vec::new();
+    if let Some(k) = cloud::read_key(data, "claude.key") {
+        clouds.push(Arc::new(Cloud::Claude(Claude::new(k)?)));
     }
-    for (rank, (c, usage)) in clouds.iter().enumerate() {
-        println!("☁ {}", usage.lock().unwrap().line(c.name()));
-        for _ in 0..c.pace().workers {
-            tokio::spawn(cloud_worker(state.clone(), cdp.clone(), wake.clone(), c.clone(), rank, usage.clone()));
+    if let Some(k) = cloud::read_key(data, "gemini.key") {
+        match Gemini::connect(k).await {
+            Ok(g) => clouds.push(Arc::new(Cloud::Gemini(g))),
+            Err(e) => println!("Gemini недоступен ({e})."),
         }
     }
+    println!("{}", clouds_line(&clouds.iter().map(|c| (c.name(), c.model())).collect::<Vec<_>>(), local));
+    Ok(Arc::new(clouds.into_iter().map(|c| (c.clone(), Arc::new(std::sync::Mutex::new(c.usage(data))))).collect()))
+}
 
-    {
-        let (state, exit) = (state.clone(), exit.clone());
-        tokio::spawn(async move {
-            let mut close = tokio::signal::windows::ctrl_close().expect("ctrl_close");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = close.recv() => {}
-            }
-            shutdown(&state, &exit, true).await;
-        });
+fn clouds_line(clouds: &[(&str, &str)], local: bool) -> String {
+    if clouds.is_empty() {
+        let rest = if local { "всё переводит RTX" } else { "работает только словарь" };
+        return format!("Облако: нет ключей в data\\claude.key и data\\gemini.key — {rest}.");
     }
-    {
-        let state = state.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                state.lock().await.tr.save();
-            }
-        });
-    }
+    let names: Vec<String> = clouds
+        .iter()
+        .enumerate()
+        .map(|(i, (n, m))| format!("{} {n} ({m})", if i == 0 { "основное" } else { "запасное" }))
+        .collect();
+    format!("Облако: {} — тексты и названия, кроме личных страниц.", names.join(", "))
+}
 
-    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<Value>();
-    {
-        let cdp = cdp.clone();
-        let (state, exit) = (state.clone(), exit.clone());
-        tokio::spawn(async move {
-            while let Some(Ok(m)) = stream.next().await {
-                let Message::Text(t) = m else { continue };
-                let Ok(v) = serde_json::from_str::<Value>(&t) else { continue };
-                if let Some(id) = v.get("id").and_then(|x| x.as_u64()) {
-                    if let Some(tx) = cdp.pending.lock().await.remove(&id) {
-                        let _ = tx.send(v);
-                    }
-                } else if ev_tx.send(v).is_err() {
-                    break;
-                }
-            }
-            println!("Taobao закрыт.");
-            shutdown(&state, &exit, false).await;
-        });
-    }
+async fn load_shop(data: &Path) -> Result<Arc<Shop>> {
+    let settings = money::Settings::load(data);
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(10)).build()?;
+    let rates = money::Rates::load(data, &http).await;
+    println!("{}", rates_line(rates.as_ref(), &settings));
+    let _ = SCRIPT.set(page_config(rates.as_ref(), &settings) + INJECT);
+    Ok(Arc::new(Shop { rates, settings, seen: std::sync::Mutex::new(HashMap::new()) }))
+}
 
-    cdp.call("Target.setDiscoverTargets", json!({"discover": true}), None).await?;
-    let mut attached: HashMap<String, String> = HashMap::new();
-    let initial = cdp.call("Target.getTargets", json!({}), None).await?;
-    let mut infos: Vec<Value> = initial["targetInfos"].as_array().cloned().unwrap_or_default();
-
-    println!("Перевод включён. Alt+T в окне Taobao — показать оригинал. Закрыть это окно — выключить перевод.");
-    loop {
-        for info in infos.drain(..) {
-            let id = info["targetId"].as_str().unwrap_or("").to_string();
-            let url = info["url"].as_str().unwrap_or("").to_string();
-            if !wanted(&info) {
-                continue;
-            }
-            match attached.get(&id) {
-                None => {
-                    attached.insert(id.clone(), url.clone());
-                    let (cdp, state) = (cdp.clone(), state.clone());
-                    tokio::spawn(async move {
-                        match cdp.call("Target.attachToTarget", json!({"targetId": &id, "flatten": true}), None).await {
-                            Ok(r) => {
-                                if let Some(s) = r["sessionId"].as_str() {
-                                    setup_session(cdp.clone(), state, id.clone(), s.to_string(), url).await;
-                                }
-                            }
-                            Err(e) => eprintln!("[!] attach: {e}"),
-                        }
-                    });
-                }
-                Some(old) if old != &url => {
-                    attached.insert(id.clone(), url.clone());
-                    let mut st = state.lock().await;
-                    if let Some(s) = st.target_session.get(&id).cloned() {
-                        if is_private(&url) {
-                            st.private_sessions.insert(s);
-                        } else {
-                            st.private_sessions.remove(&s);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        let Some(ev) = ev_rx.recv().await else { break };
-        match ev["method"].as_str().unwrap_or("") {
-            "Target.targetCreated" | "Target.targetInfoChanged" => infos.push(ev["params"]["targetInfo"].clone()),
-            "Target.targetDestroyed" | "Target.detachedFromTarget" => {
-                if let Some(id) = ev["params"]["targetId"].as_str() {
-                    attached.remove(id);
-                }
-            }
-            "Runtime.executionContextCreated" => {
-                let ctx = &ev["params"]["context"];
-                if let (Some(s), Some(cid)) = (ev["sessionId"].as_str(), ctx["id"].as_i64()) {
-                    if ctx["auxData"]["isDefault"] == true {
-                        let id = cdp.next.fetch_add(1, Ordering::Relaxed);
-                        let msg = json!({"id": id, "method": "Runtime.evaluate", "sessionId": s,
-                            "params": {"expression": format!("if(!window.__tbtr){{{}}}", script()), "contextId": cid}});
-                        let _ = cdp.tx.send(Message::Text(msg.to_string()));
-                    }
-                }
-            }
-            "Runtime.bindingCalled" if ev["params"]["name"] == "__tbtr_send" => {
-                if let (Some(s), Some(p)) = (ev["sessionId"].as_str(), ev["params"]["payload"].as_str()) {
-                    match serde_json::from_str::<Value>(p) {
-                        Ok(v) if v["item"].is_object() => {
-                            let (cdp, clouds, shop, s) = (cdp.clone(), clouds.clone(), shop.clone(), s.to_string());
-                            let url = v["item"]["url"].as_str().unwrap_or("").to_string();
-                            let text = v["item"]["text"].as_str().unwrap_or("").to_string();
-                            tokio::spawn(async move { on_item(&cdp, &clouds, &shop, &s, url, text).await });
-                        }
-                        Ok(v) if v["search"].is_string() => {
-                            let (state, cdp, clouds, s) = (state.clone(), cdp.clone(), clouds.clone(), s.to_string());
-                            let id = v["id"].as_u64().unwrap_or(0);
-                            let ru = v["search"].as_str().unwrap_or("").to_string();
-                            tokio::spawn(async move { on_search(&state, &cdp, &clouds, &s, id, ru).await });
-                        }
-                        _ => on_request(&state, &cdp, &wake, s, p).await,
-                    }
-                }
-            }
-            _ => {}
-        }
+fn rates_line(r: Option<&money::Rates>, s: &money::Settings) -> String {
+    match r {
+        Some(r) => format!(
+            "Курс ЦБ на {}: 1 ¥ = {:.2} сум, 1 $ = {:.2} сум; наценка ×{}, карго {} ${}/кг.",
+            r.date, r.uzs_per_cny, r.uzs_per_usd, s.markup, s.cargo_name, s.cargo_usd_per_kg
+        ),
+        None => "Курс ЦБ недоступен — цены в сумах не показываю.".into(),
     }
-    state.lock().await.tr.save();
+}
+
+async fn start_outside(root: &Path, local: bool) -> Result<Arc<Exit>> {
+    let installed = warp::installed();
+    let warp_ours = if installed { warp::ensure_on().await? } else { false };
+    println!("{}", warp_line(installed, warp_ours));
+    let llama = if local { ensure_model(root).await? } else { None };
+    Ok(Arc::new(Exit { warp_ours, llama: std::sync::Mutex::new(llama) }))
+}
+
+fn warp_line(installed: bool, ours: bool) -> &'static str {
+    match (installed, ours) {
+        (false, _) => "Cloudflare WARP не найден — запускаю без него.",
+        (true, true) => "WARP включён (выключу при выходе).",
+        (true, false) => "WARP уже был включён (оставлю как есть).",
+    }
+}
+
+async fn judge_and_print(clouds: &Clouds, shop: &Shop, f: &str) -> Result<()> {
+    let text = std::fs::read_to_string(f).with_context(|| f.to_string())?;
+    let card = judge(clouds, shop, f, &text).await;
+    println!("{}", serde_json::to_string_pretty(&card).unwrap_or_default());
     Ok(())
+}
+
+fn mode_line(local: bool) -> &'static str {
+    match local {
+        true => "Режим: облако + RTX (личные страницы переводит RTX)",
+        false => "Режим: лёгкий, без локальной модели (личные страницы — только словарь)",
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = Args::parse(&std::env::args().collect::<Vec<_>>());
+    let single = std::net::TcpListener::bind("127.0.0.1:9339");
+    if args.judge_file.is_none() && single.is_err() {
+        println!("Переводчик уже запущен в другом окне.");
+        return Ok(());
+    }
+    let root = find_root();
+    let data = root.join("data");
+    let tr = Translator::load(&data, &format!("http://127.0.0.1:{MODEL_PORT}/v1/chat/completions"))?;
+    println!("Taobao → русский. Папка: {}. Словарь и кэш: {} готовых переводов.", root.display(), tr.cache.len());
+    println!("{}", mode_line(args.local));
+    let clouds = load_clouds(&data, args.local).await?;
+    let shop = load_shop(&data).await?;
+    if let Some(f) = &args.judge_file {
+        return judge_and_print(&clouds, &shop, f).await;
+    }
+    let exit = start_outside(&root, args.local).await?;
+    let (cdp, events, reader) = connect_devtools(&ensure_taobao().await?).await?;
+    let state: Shared = Arc::new(Mutex::new(State::new(tr, clouds.len(), args.local)));
+    let app = App { state, cdp, clouds, shop, wake: Arc::new(Notify::new()), exit };
+    app.start_workers(args.local);
+    app.watch_exit();
+    let closing = app.clone();
+    tokio::spawn(async move {
+        reader.await;
+        println!("Taobao закрыт.");
+        shutdown(&closing.state, &closing.exit, false).await;
+    });
+    app.run(events).await
 }
 
 #[cfg(test)]
@@ -902,5 +1095,301 @@ mod tests {
         assert_eq!(route(false, true, false), Route::Cloud);
         assert_eq!(route(false, false, false), Route::DraftOnly);
         assert_eq!(route(false, false, true), Route::Local);
+    }
+
+    fn state(clouds: usize, local: bool) -> State {
+        let dir = std::env::temp_dir().join(format!("tbtr_st_{}_{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("glossary.json"), r#"{"宝贝": "товар", "男士": "мужские", "新款": "новинка"}"#).unwrap();
+        let _ = std::fs::remove_file(dir.join("cache.json"));
+        State::new(Translator::load(&dir, "http://127.0.0.1:1").unwrap(), clouds, local)
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn queue_keeps_visible_text_first_and_never_twice() {
+        let mut q = Queue::default();
+        q.push("长长长长", true);
+        q.push("短", true);
+        q.push("下面", false);
+        q.push("短", false);
+        q.push("下面", false);
+        assert_eq!(q.len(), 3);
+        assert_eq!(q.pick_one().as_deref(), Some("短"), "shortest visible first");
+        assert_eq!(q.pick_batch(5), strings(&["长长长长", "下面"]));
+        assert_eq!(q.pick_one(), None);
+    }
+
+    #[test]
+    fn known_text_is_answered_at_once_and_new_text_is_queued_for_the_cloud() {
+        let mut st = state(1, true);
+        let asked = st.ask("s1", &json!({"hi": ["宝贝", "男士新款外套"], "lo": ["别的"]}));
+        assert_eq!(asked.ready.get("宝贝").map(String::as_str), Some("товар"));
+        assert_eq!(asked.drafts.get("男士新款外套").map(String::as_str), Some("мужские · новинка …"));
+        assert!(asked.queued);
+        assert_eq!(st.cloud_q.pick_batch(9), strings(&["男士新款外套", "别的"]));
+        assert_eq!(st.local_q.len(), 0);
+    }
+
+    #[test]
+    fn private_pages_go_to_the_local_model_or_stay_drafts() {
+        let mut st = state(1, true);
+        st.private_sessions.insert("p".into());
+        st.ask("p", &json!({"hi": ["收货地址"]}));
+        assert_eq!((st.cloud_q.len(), st.local_q.len()), (0, 1));
+        assert!(st.private_strs.contains("收货地址"));
+        let mut light = state(1, false);
+        light.private_sessions.insert("p".into());
+        assert!(!light.ask("p", &json!({"hi": ["收货地址"]})).queued);
+        assert_eq!((light.cloud_q.len(), light.local_q.len()), (0, 0));
+    }
+
+    #[test]
+    fn text_already_being_translated_is_not_queued_again() {
+        let mut st = state(1, true);
+        st.in_flight.insert("别的".into());
+        assert!(!st.ask("s", &json!({"hi": ["别的"]})).queued);
+        assert_eq!(st.subs["别的"].len(), 1, "the page still gets the answer");
+    }
+
+    #[test]
+    fn results_go_to_every_page_that_asked_and_are_remembered() {
+        let mut st = state(1, true);
+        st.ask("a", &json!({"hi": ["别的"]}));
+        st.ask("b", &json!({"lo": ["别的"]}));
+        st.in_flight.insert("别的".into());
+        let per = st.done(&[("别的".into(), "Другое".into())], 5, "cloud");
+        assert_eq!(per.len(), 2);
+        assert_eq!(per["a"]["别的"], "Другое");
+        assert!(st.in_flight.is_empty());
+        assert_eq!(st.stats, (1, 0));
+        assert!(matches!(st.tr.fast("别的"), Hit::Fast(t) if t == "Другое"));
+    }
+
+    #[test]
+    fn idle_cloud_takes_waiting_local_work_but_not_private_text() {
+        let mut st = state(1, true);
+        st.local_q.push("一", true);
+        st.local_q.push("私", true);
+        st.local_q.push("二", false);
+        st.private_strs.insert("私".into());
+        let (b, _) = st.cloud_batch(0, 10).unwrap();
+        assert_eq!(b, strings(&["一", "二"]));
+        assert_eq!(st.local_q.pick_batch(9), strings(&["私"]));
+        assert!(st.in_flight.contains("一"));
+    }
+
+    #[test]
+    fn only_the_first_working_cloud_takes_batches() {
+        let mut st = state(2, true);
+        st.cloud_q.push("一", true);
+        assert!(st.cloud_batch(1, 10).is_none(), "reserve waits while the main cloud works");
+        st.cloud_off[0] = Some(Instant::now() + Duration::from_secs(60));
+        assert!(st.cloud_batch(1, 10).is_some());
+    }
+
+    #[test]
+    fn busy_cloud_puts_the_batch_back_in_front() {
+        let mut st = state(1, true);
+        st.cloud_q.push("三", true);
+        let after = st.cloud_failed(0, strings(&["一", "二"]), &CloudErr::Busy, Duration::ZERO, Duration::from_secs(2));
+        assert!(matches!(after, After::Wait(d) if d == Duration::from_secs(2)));
+        assert_eq!(st.cloud_q.pick_batch(9), strings(&["一", "二", "三"]));
+    }
+
+    #[test]
+    fn switched_off_cloud_hands_work_to_the_reserve_then_to_the_local_model() {
+        let mut st = state(2, true);
+        let off = CloudErr::Off("no credit".into());
+        st.cloud_failed(0, strings(&["一"]), &off, Duration::from_secs(60), Duration::ZERO);
+        assert_eq!(st.active_cloud(), Some(1));
+        assert_eq!(st.next_route_name(), "запасное облако");
+        assert_eq!(st.cloud_q.pick_batch(9), strings(&["一"]));
+        st.cloud_q.push("二", false);
+        st.cloud_failed(1, strings(&["一"]), &off, Duration::from_secs(60), Duration::ZERO);
+        assert_eq!(st.next_route_name(), "RTX");
+        assert_eq!(st.local_q.pick_batch(9), strings(&["一", "二"]));
+    }
+
+    #[test]
+    fn a_broken_batch_is_not_sent_to_the_same_cloud_again() {
+        let mut st = state(1, false);
+        st.cloud_failed(0, strings(&["一"]), &CloudErr::Other(anyhow!("bad JSON")), Duration::ZERO, Duration::ZERO);
+        assert_eq!((st.cloud_q.len(), st.local_q.len()), (0, 0));
+        assert_eq!(st.active_cloud(), Some(0), "one broken answer does not switch the cloud off");
+        let mut rtx = state(1, true);
+        rtx.cloud_failed(0, strings(&["一"]), &CloudErr::Other(anyhow!("bad JSON")), Duration::ZERO, Duration::ZERO);
+        assert_eq!(rtx.local_q.len(), 1);
+    }
+
+    #[test]
+    fn local_jobs_skip_known_and_running_text_and_come_back_after_a_failure() {
+        let mut st = state(0, true);
+        st.local_q.push("宝贝", true);
+        st.local_q.push("一", true);
+        st.local_q.push("二", true);
+        st.tr.cache.insert("宝贝".into(), "товар".into());
+        st.in_flight.insert("一".into());
+        assert_eq!(st.local_job().as_deref(), Some("二"));
+        assert_eq!(st.local_job(), None);
+        st.local_failed("二");
+        assert_eq!(st.local_job().as_deref(), Some("二"));
+    }
+
+    #[test]
+    fn only_real_pages_are_watched_and_personal_ones_stay_local() {
+        assert!(wanted(&json!({"type": "page", "url": "https://s.taobao.com/search?q=1"})));
+        assert!(wanted(&json!({"type": "iframe", "url": "https://x.taobao.com"})));
+        for (t, u) in [("page", "devtools://x"), ("page", "chrome://gpu"), ("page", ""), ("page", "about:blank"), ("service_worker", "https://www.taobao.com/sw.js")] {
+            assert!(!wanted(&json!({"type": t, "url": u})), "{t} {u}");
+        }
+        for u in ["https://buyertrade.taobao.com/trade/itemlist", "https://market.m.taobao.com/app/im/chat-core/index.html", "https://login.taobao.com/", "https://member1.taobao.com/member/fresh/deliver_address.htm", "file:///D:/taobao/pages/purchaseListBubble/index.html"] {
+            assert!(is_private(u), "{u}");
+        }
+        for u in ["https://s.taobao.com/search?q=1", "https://item.taobao.com/item.htm?id=1", "https://cart.taobao.com/cart.htm"] {
+            assert!(!is_private(u), "{u}");
+        }
+    }
+
+    #[test]
+    fn product_key_is_the_item_id() {
+        assert_eq!(item_key("https://item.taobao.com/item.htm?spm=a&id=611830625730&ns=1"), "611830625730");
+        assert_eq!(item_key("https://detail.tmall.com/item.htm?id=42#reviews"), "42");
+        assert_eq!(item_key("bench/item_boots.txt#x"), "bench/item_boots.txt");
+    }
+
+    #[test]
+    fn pages_get_the_soum_rate_with_the_markup_or_nothing() {
+        let r = money::Rates { uzs_per_cny: 1800.0, uzs_per_usd: 12000.0, date: "x".into() };
+        let s = money::Settings { markup: 1.5, ..money::Settings::default() };
+        assert_eq!(page_config(Some(&r), &s), r#"window.__tbtr_cfg={"uzsPerCny":2700.0};"#);
+        assert_eq!(page_config(None, &s), "window.__tbtr_cfg={};");
+    }
+
+    #[test]
+    fn switched_off_claude_waits_half_an_hour_and_gemini_until_its_quota_resets() {
+        let dir = std::env::temp_dir().join(format!("tbtr_op_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Cloud::Claude(Claude::new("k".into()).unwrap());
+        let u = std::sync::Mutex::new(c.usage(&dir));
+        assert_eq!(off_pause(&c, &u), Duration::from_secs(1800));
+    }
+
+    fn args(v: &[&str]) -> Args {
+        Args::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn command_line_picks_light_mode_and_the_judge_file() {
+        assert_eq!(args(&["tr.exe"]), Args { judge_file: None, local: true });
+        assert_eq!(args(&["tr.exe", "--no-local"]), Args { judge_file: None, local: false });
+        assert_eq!(args(&["tr.exe", "--judge-file", "a.txt", "--no-local"]), Args { judge_file: Some("a.txt".into()), local: false });
+        assert_eq!(args(&["tr.exe", "--judge-file"]).judge_file, None);
+    }
+
+    #[test]
+    fn page_messages_are_items_searches_or_texts() {
+        assert_eq!(page_msg(r#"{"item":{"url":"u","text":"t"}}"#), PageMsg::Item { url: "u".into(), text: "t".into() });
+        assert_eq!(page_msg(r#"{"search":"челси","id":3}"#), PageMsg::Search { id: 3, ru: "челси".into() });
+        assert_eq!(page_msg(r#"{"hi":["宝贝"],"lo":[]}"#), PageMsg::Texts);
+        assert_eq!(page_msg("not json"), PageMsg::Texts);
+    }
+
+    #[test]
+    fn devtools_events_are_sorted_out() {
+        let info = json!({"targetId": "T", "type": "page", "url": "u"});
+        assert_eq!(event(&json!({"method": "Target.targetCreated", "params": {"targetInfo": info}})), Event::Target(info.clone()));
+        assert_eq!(event(&json!({"method": "Target.targetInfoChanged", "params": {"targetInfo": info}})), Event::Target(info));
+        assert_eq!(event(&json!({"method": "Target.targetDestroyed", "params": {"targetId": "T"}})), Event::Gone("T".into()));
+        assert_eq!(event(&json!({"method": "Target.detachedFromTarget", "params": {}})), Event::Other);
+        let ctx = |default: bool| json!({"method": "Runtime.executionContextCreated", "sessionId": "S", "params": {"context": {"id": 7, "auxData": {"isDefault": default}}}});
+        assert_eq!(event(&ctx(true)), Event::NewDocument { session: "S".into(), context: 7 });
+        assert_eq!(event(&ctx(false)), Event::Other);
+        let bind = |name: &str| json!({"method": "Runtime.bindingCalled", "sessionId": "S", "params": {"name": name, "payload": "{}"}});
+        assert_eq!(event(&bind("__tbtr_send")), Event::Page { session: "S".into(), payload: "{}".into() });
+        assert_eq!(event(&bind("other")), Event::Other);
+        assert_eq!(event(&json!({"method": "Runtime.consoleAPICalled"})), Event::Other);
+    }
+
+    #[test]
+    fn tabs_are_attached_once_and_rechecked_when_they_navigate() {
+        let mut t = Targets::default();
+        let info = |url: &str| json!({"targetId": "T", "type": "page", "url": url});
+        assert_eq!(t.update(&info("https://s.taobao.com/search")), TargetChange::Attach { id: "T".into(), url: "https://s.taobao.com/search".into() });
+        assert_eq!(t.update(&info("https://s.taobao.com/search")), TargetChange::Nothing);
+        assert_eq!(t.update(&info("https://buyertrade.taobao.com/trade")), TargetChange::Moved { id: "T".into(), private: true });
+        assert_eq!(t.update(&json!({"targetId": "W", "type": "service_worker", "url": "x"})), TargetChange::Nothing);
+        t.gone("T");
+        assert!(matches!(t.update(&info("https://s.taobao.com/search")), TargetChange::Attach { .. }));
+    }
+
+    #[test]
+    fn a_tab_that_moves_to_a_personal_page_becomes_local_only_and_back() {
+        let mut st = state(1, true);
+        st.target_session.insert("T".into(), "S".into());
+        st.moved("T", true);
+        assert!(st.private_sessions.contains("S"));
+        st.moved("T", false);
+        assert!(!st.private_sessions.contains("S"));
+        st.moved("unknown", true);
+        assert_eq!(st.private_sessions.len(), 0);
+    }
+
+    #[test]
+    fn start_lines_say_what_is_on() {
+        assert_eq!(clouds_line(&[], true), "Облако: нет ключей в data\\claude.key и data\\gemini.key — всё переводит RTX.");
+        assert!(clouds_line(&[], false).ends_with("работает только словарь."));
+        assert_eq!(
+            clouds_line(&[("Claude", "h"), ("Gemini", "g")], true),
+            "Облако: основное Claude (h), запасное Gemini (g) — тексты и названия, кроме личных страниц."
+        );
+        let r = money::Rates { uzs_per_cny: 1795.58, uzs_per_usd: 11973.44, date: "13.11.2026".into() };
+        assert_eq!(
+            rates_line(Some(&r), &money::Settings::default()),
+            "Курс ЦБ на 13.11.2026: 1 ¥ = 1795.58 сум, 1 $ = 11973.44 сум; наценка ×1, карго Top Cargo авиа $11/кг."
+        );
+        assert!(rates_line(None, &money::Settings::default()).contains("недоступен"));
+        assert!(warp_line(false, false).contains("не найден"));
+        assert!(warp_line(true, true).contains("выключу при выходе"));
+        assert!(warp_line(true, false).contains("оставлю как есть"));
+        assert!(mode_line(true).contains("RTX"));
+        assert!(mode_line(false).contains("лёгкий"));
+    }
+
+    #[test]
+    fn the_page_gets_the_chinese_query_or_null_to_search_as_typed() {
+        let f: Found = ("切尔西靴男".into(), "челси мужские".into(), "кэш");
+        assert_eq!(search_reply(4, Some(&f)), r#"window.__tbtr_search_done&&window.__tbtr_search_done(4,"切尔西靴男","челси мужские")"#);
+        assert_eq!(search_reply(5, None), "window.__tbtr_search_done&&window.__tbtr_search_done(5,null,null)");
+    }
+
+    #[test]
+    fn a_product_is_judged_again_only_when_much_more_of_its_page_loaded() {
+        let shop = Shop { rates: None, settings: money::Settings::default(), seen: std::sync::Mutex::new(HashMap::new()) };
+        shop.seen.lock().unwrap().insert("1".into(), (100, json!({"label": "x"})));
+        assert_eq!(seen_card(&shop, "1", &"a".repeat(150)), Some(json!({"label": "x"})));
+        assert_eq!(seen_card(&shop, "1", &"a".repeat(151)), None);
+        assert_eq!(seen_card(&shop, "2", "a"), None);
+    }
+
+    #[test]
+    fn product_verdicts_use_claude_only() {
+        let dir = std::env::temp_dir().join(format!("tbtr_co_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Arc::new(Cloud::Claude(Claude::new("k".into()).unwrap()));
+        let clouds: Clouds = Arc::new(vec![(c.clone(), Arc::new(std::sync::Mutex::new(c.usage(&dir))))]);
+        assert!(claude_of(&clouds).is_some());
+        let none: Clouds = Arc::new(vec![]);
+        assert!(claude_of(&none).is_none());
+    }
+
+    #[test]
+    fn short_and_cut_keep_log_lines_short() {
+        assert_eq!(short("https://a.b/c?x=1"), "https://a.b/c");
+        assert_eq!(cut("абвгд", 3), "абв…");
+        assert_eq!(cut("аб", 3), "аб");
     }
 }

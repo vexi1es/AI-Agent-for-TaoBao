@@ -51,14 +51,40 @@ pub fn schema() -> Value {
     })
 }
 
+impl Grade {
+    fn parse(s: Option<&str>) -> Result<Self> {
+        match s {
+            Some("good") => Ok(Grade::Good),
+            Some("ok") => Ok(Grade::Ok),
+            Some("bad") => Ok(Grade::Bad),
+            g => Err(anyhow!("непонятная оценка: {g:?}")),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Grade::Good => "good",
+            Grade::Ok => "ok",
+            Grade::Bad => "bad",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Grade::Good => "✅ Хорошо",
+            Grade::Ok => "🟡 Средне",
+            Grade::Bad => "❌ Плохо",
+        }
+    }
+}
+
+fn weight(v: &Value) -> Result<f64> {
+    v.as_f64().filter(|w| *w > 0.0 && *w < 100_000.0).ok_or_else(|| anyhow!("странный вес"))
+}
+
 pub fn parse_verdict(o: &Value) -> Result<Verdict> {
-    let grade = match o["grade"].as_str() {
-        Some("good") => Grade::Good,
-        Some("ok") => Grade::Ok,
-        Some("bad") => Grade::Bad,
-        g => return Err(anyhow!("непонятная оценка: {g:?}")),
-    };
-    let weight_g = o["weight_g"].as_f64().filter(|w| *w > 0.0 && *w < 100_000.0).ok_or_else(|| anyhow!("странный вес"))?;
+    let grade = Grade::parse(o["grade"].as_str())?;
+    let weight_g = weight(&o["weight_g"])?;
     let text = |k: &str| o[k].as_str().unwrap_or("").trim().to_string();
     let banned = Some(text("banned")).filter(|b| !b.is_empty());
     Ok(Verdict {
@@ -112,29 +138,34 @@ pub fn digest(text: &str, limit: usize) -> String {
     lines.join("\n").chars().take(limit).collect()
 }
 
-pub fn card(v: &Verdict, rates: Option<&Rates>, s: &Settings) -> Value {
-    let label = match v.grade {
-        Grade::Good => "✅ Хорошо",
-        Grade::Ok => "🟡 Средне",
-        Grade::Bad => "❌ Плохо",
-    };
-    let tariff = format!("{}, ${}/кг", s.cargo_name, s.cargo_usd_per_kg);
-    let price = match (v.price_cny, rates) {
+fn price_line(v: &Verdict, rates: Option<&Rates>, s: &Settings) -> Value {
+    match (v.price_cny, rates) {
         (Some(p), Some(r)) => json!(format!("¥{p} · {}", sum(price_uzs(p, r, s)))),
         (Some(p), None) => json!(format!("¥{p}")),
         _ => Value::Null,
-    };
-    let cargo = match rates {
+    }
+}
+
+fn cargo_line(v: &Verdict, rates: Option<&Rates>, s: &Settings) -> String {
+    let tariff = format!("{}, ${}/кг", s.cargo_name, s.cargo_usd_per_kg);
+    match rates {
         Some(r) => format!("≈ {} ({tariff})", sum(cargo_uzs(v.weight_g, r, s))),
         None => format!("~${:.2} ({tariff})", v.weight_g / 1000.0 * s.cargo_usd_per_kg),
-    };
-    let total = match (v.price_cny, rates) {
+    }
+}
+
+fn total_line(v: &Verdict, rates: Option<&Rates>, s: &Settings) -> Value {
+    match (v.price_cny, rates) {
         (Some(p), Some(r)) => json!(format!("≈ {} с доставкой", sum(price_uzs(p, r, s) + cargo_uzs(v.weight_g, r, s)))),
         _ => Value::Null,
-    };
+    }
+}
+
+pub fn card(v: &Verdict, rates: Option<&Rates>, s: &Settings) -> Value {
+    let (price, cargo, total) = (price_line(v, rates, s), cargo_line(v, rates, s), total_line(v, rates, s));
     json!({
-        "grade": match v.grade { Grade::Good => "good", Grade::Ok => "ok", Grade::Bad => "bad" },
-        "label": label,
+        "grade": v.grade.name(),
+        "label": v.grade.label(),
         "why": v.why,
         "complaints": v.complaints,
         "price": price,
@@ -210,6 +241,22 @@ mod tests {
         assert_eq!(c["cargo"], "≈ 112 000 сум (Top Cargo авиа, $11/кг)");
         assert_eq!(c["total"], "≈ 242 300 сум с доставкой");
         assert_eq!(c["banned"], Value::Null);
+    }
+
+    #[test]
+    fn every_grade_has_its_own_label() {
+        for (g, label) in [("good", "✅ Хорошо"), ("ok", "🟡 Средне"), ("bad", "❌ Плохо")] {
+            let mut r = reply();
+            r["grade"] = json!(g);
+            let c = card(&parse_verdict(&r).unwrap(), None, &Settings::default());
+            assert_eq!((c["grade"].as_str(), c["label"].as_str()), (Some(g), Some(label)));
+        }
+    }
+
+    #[test]
+    fn price_without_rates_is_shown_in_yuan_only() {
+        let c = card(&parse_verdict(&reply()).unwrap(), None, &Settings::default());
+        assert_eq!(c["price"], "¥72.6");
     }
 
     #[test]

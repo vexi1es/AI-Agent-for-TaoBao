@@ -11,3 +11,4 @@ bench/*.log
 bench/*_out.json
 bench/cmp_out.*
 node_modules/
+mutants.out*/

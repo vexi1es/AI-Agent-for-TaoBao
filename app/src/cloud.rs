@@ -67,6 +67,13 @@ impl Cloud {
     }
 }
 
+async fn post_json(req: reqwest::RequestBuilder) -> std::result::Result<(u16, Value), CloudErr> {
+    let r = req.send().await.map_err(|e| CloudErr::Other(e.into()))?;
+    let status = r.status().as_u16();
+    let v: Value = r.json().await.map_err(|e| CloudErr::Other(e.into()))?;
+    Ok((status, v))
+}
+
 pub fn read_key(data: &Path, file: &str) -> Option<String> {
     let s = std::fs::read_to_string(data.join(file)).ok()?;
     s.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with('#') && *l != "KEY").map(String::from)
@@ -123,13 +130,23 @@ pub const SEARCH_PROMPT: &str = "Ты помогаешь покупателю и
 Бренды, модели, размеры и латиницу оставь как есть. \
 Ответ: JSON {\"q\": китайский запрос, \"ru\": очень короткий обратный перевод этого запроса на русский}.";
 
+const MONEY_WORDS: [&str; 4] = ["credit", "billing", "spend", "limit"];
+
+fn about_money(msg: &str) -> bool {
+    let low = msg.to_lowercase();
+    MONEY_WORDS.iter().any(|w| low.contains(w))
+}
+
+fn or_default(msg: String, default: &str) -> String {
+    if msg.is_empty() { default.into() } else { msg }
+}
+
 fn claude_error(status: u16, v: &Value) -> CloudErr {
     let msg = v["error"]["message"].as_str().unwrap_or("").to_string();
-    let low = msg.to_lowercase();
     match status {
         429 | 500 | 502 | 503 | 504 | 529 => CloudErr::Busy,
-        401 | 403 => CloudErr::Off(if msg.is_empty() { "ключ не принят".into() } else { msg }),
-        400 if low.contains("credit") || low.contains("billing") || low.contains("spend") || low.contains("limit") => CloudErr::Off(msg),
+        401 | 403 => CloudErr::Off(or_default(msg, "ключ не принят")),
+        400 if about_money(&msg) => CloudErr::Off(msg),
         _ => CloudErr::Other(anyhow!("HTTP {status}: {msg}")),
     }
 }
@@ -183,17 +200,8 @@ impl Claude {
     }
 
     async fn call(&self, body: &Value) -> std::result::Result<Value, CloudErr> {
-        let r = self
-            .http
-            .post(ANTHROPIC)
-            .header("x-api-key", &self.key)
-            .header("anthropic-version", "2026-10-21")
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| CloudErr::Other(e.into()))?;
-        let status = r.status().as_u16();
-        let v: Value = r.json().await.map_err(|e| CloudErr::Other(e.into()))?;
+        let req = self.http.post(ANTHROPIC).header("x-api-key", &self.key).header("anthropic-version", "2026-10-21").json(body);
+        let (status, v) = post_json(req).await?;
         if status >= 400 {
             return Err(claude_error(status, &v));
         }
@@ -228,86 +236,88 @@ pub struct Gemini {
 impl Gemini {
     pub async fn connect(key: String) -> Result<Self> {
         let http = reqwest::Client::builder().timeout(Duration::from_secs(60)).build()?;
-        let v: Value = http
-            .get(format!("{GEMINI}/models?pageSize=200"))
-            .header("x-goog-api-key", &key)
-            .send()
-            .await?
-            .json()
-            .await?;
-        if let Some(e) = v.get("error") {
-            return Err(anyhow!("{}", e["message"].as_str().unwrap_or("ключ не принят")));
-        }
-        let mut names: Vec<String> = v["models"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|m| {
-                m["supportedGenerationMethods"].as_array().map_or(false, |a| a.iter().any(|x| x == "generateContent"))
-            })
-            .filter_map(|m| m["name"].as_str().map(|n| n.trim_start_matches("models/").to_string()))
-            .filter(|n| n.starts_with("gemini-") && !n.contains("preview") && !n.contains("exp") && !n.contains("tts") && !n.contains("image") && !n.contains("live") && !n.contains("embedding"))
-            .collect();
-        let score = |n: &str| -> (u8, i64) {
-            let kind = if n.contains("flash-lite") { 2 } else if n.contains("flash") { 1 } else { 0 };
-            let ver: f64 = n.trim_start_matches("gemini-").split('-').next().unwrap_or("0").parse().unwrap_or(0.0);
-            (kind, (ver * 100.0) as i64)
-        };
-        names.sort_by_key(|n| std::cmp::Reverse(score(n)));
-        let model = names.into_iter().find(|n| score(n).0 > 0).ok_or_else(|| anyhow!("нет моделей Flash для этого ключа"))?;
+        let v: Value = http.get(format!("{GEMINI}/models?pageSize=200")).header("x-goog-api-key", &key).send().await?.json().await?;
+        let model = pick_model(&v)?;
         Ok(Self { http, key, model, think_ctl: std::sync::atomic::AtomicBool::new(true) })
     }
 
     async fn translate(&self, system: &str, items: &[String]) -> std::result::Result<Vec<String>, CloudErr> {
-        let mut body = json!({
-            "systemInstruction": {"parts": [{"text": system}]},
-            "contents": [{"role": "user", "parts": [{"text": serde_json::to_string(items).unwrap()}]}],
-            "generationConfig": {
-                "temperature": 0.2,
-                "responseMimeType": "application/json",
-                "responseSchema": {"type": "ARRAY", "items": {"type": "STRING"}},
-                "thinkingConfig": {"thinkingLevel": "low"}
-            }
-        });
-        if !self.think_ctl.load(std::sync::atomic::Ordering::Relaxed) {
-            if let Some(g) = body["generationConfig"].as_object_mut() {
-                g.remove("thinkingConfig");
-            }
-        }
-        let r = self
-            .http
-            .post(format!("{GEMINI}/models/{}:generateContent", self.model))
-            .header("x-goog-api-key", &self.key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| CloudErr::Other(e.into()))?;
-        let status = r.status().as_u16();
-        let v: Value = r.json().await.map_err(|e| CloudErr::Other(e.into()))?;
-        if status == 503 || status == 500 || status == 504 {
-            return Err(CloudErr::Busy);
-        }
-        if status == 429 {
-            let msg = v["error"]["message"].as_str().unwrap_or("").to_string();
-            return Err(if msg.to_lowercase().contains("per day") || msg.contains("PerDay") { CloudErr::Off(msg) } else { CloudErr::Busy });
-        }
-        if status == 400 && self.think_ctl.load(std::sync::atomic::Ordering::Relaxed) {
+        let think = self.think_ctl.load(std::sync::atomic::Ordering::Relaxed);
+        let body = gemini_body(system, items, think);
+        let req = self.http.post(format!("{GEMINI}/models/{}:generateContent", self.model)).header("x-goog-api-key", &self.key).json(&body);
+        let (status, v) = post_json(req).await?;
+        if status == 400 && think {
             self.think_ctl.store(false, std::sync::atomic::Ordering::Relaxed);
             return Err(CloudErr::Busy);
         }
-        if status == 401 || status == 403 {
-            return Err(CloudErr::Off(v["error"]["message"].as_str().unwrap_or("доступ запрещён").to_string()));
-        }
-        if status >= 400 {
-            return Err(CloudErr::Other(anyhow!("HTTP {status}: {}", v["error"]["message"].as_str().unwrap_or(""))));
-        }
-        let text = v["candidates"][0]["content"]["parts"][0]["text"].as_str().unwrap_or("");
-        let out: Vec<String> = serde_json::from_str(text).map_err(|e| CloudErr::Other(anyhow!("bad JSON: {e}")))?;
-        if out.len() != items.len() {
-            return Err(CloudErr::Other(anyhow!("ответ {} строк вместо {}", out.len(), items.len())));
-        }
-        Ok(out)
+        gemini_parse(status, &v, items.len())
     }
+}
+
+fn model_score(n: &str) -> (u8, i64) {
+    let kind = if n.contains("flash-lite") { 2 } else if n.contains("flash") { 1 } else { 0 };
+    let ver: f64 = n.trim_start_matches("gemini-").split('-').next().unwrap_or("0").parse().unwrap_or(0.0);
+    (kind, (ver * 100.0) as i64)
+}
+
+const NOT_TEXT_MODELS: [&str; 6] = ["preview", "exp", "tts", "image", "live", "embedding"];
+
+fn text_model(m: &Value) -> Option<String> {
+    let methods = m["supportedGenerationMethods"].as_array()?;
+    if !methods.iter().any(|x| x == "generateContent") {
+        return None;
+    }
+    let n = m["name"].as_str()?.trim_start_matches("models/");
+    let usable = n.starts_with("gemini-") && !NOT_TEXT_MODELS.iter().any(|x| n.contains(x));
+    usable.then(|| n.to_string())
+}
+
+fn pick_model(v: &Value) -> Result<String> {
+    if let Some(e) = v.get("error") {
+        return Err(anyhow!("{}", e["message"].as_str().unwrap_or("ключ не принят")));
+    }
+    let mut names: Vec<String> = v["models"].as_array().into_iter().flatten().filter_map(text_model).collect();
+    names.sort_by_key(|n| std::cmp::Reverse(model_score(n)));
+    names.into_iter().find(|n| model_score(n).0 > 0).ok_or_else(|| anyhow!("нет моделей Flash для этого ключа"))
+}
+
+fn gemini_body(system: &str, items: &[String], think: bool) -> Value {
+    let mut config = json!({
+        "temperature": 0.2,
+        "responseMimeType": "application/json",
+        "responseSchema": {"type": "ARRAY", "items": {"type": "STRING"}}
+    });
+    if think {
+        config["thinkingConfig"] = json!({"thinkingLevel": "low"});
+    }
+    json!({
+        "systemInstruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": serde_json::to_string(items).unwrap_or_default()}]}],
+        "generationConfig": config
+    })
+}
+
+fn gemini_error(status: u16, v: &Value) -> CloudErr {
+    let msg = v["error"]["message"].as_str().unwrap_or("").to_string();
+    match status {
+        500 | 503 | 504 => CloudErr::Busy,
+        429 if msg.to_lowercase().contains("per day") || msg.contains("PerDay") => CloudErr::Off(msg),
+        429 => CloudErr::Busy,
+        401 | 403 => CloudErr::Off(or_default(msg, "доступ запрещён")),
+        _ => CloudErr::Other(anyhow!("HTTP {status}: {msg}")),
+    }
+}
+
+fn gemini_parse(status: u16, v: &Value, n: usize) -> std::result::Result<Vec<String>, CloudErr> {
+    if status >= 400 {
+        return Err(gemini_error(status, v));
+    }
+    let text = v["candidates"][0]["content"]["parts"][0]["text"].as_str().unwrap_or("");
+    let out: Vec<String> = serde_json::from_str(text).map_err(|e| CloudErr::Other(anyhow!("bad JSON: {e}")))?;
+    if out.len() != n {
+        return Err(CloudErr::Other(anyhow!("ответ {} строк вместо {}", out.len(), n)));
+    }
+    Ok(out)
 }
 
 const PACIFIC: i64 = -8;
@@ -445,6 +455,82 @@ mod tests {
         assert!(claude_parse("claude-haiku-5-5", &reply(r#"{"1":"Удалить"}"#, "end_turn"), 2).is_err());
         assert!(claude_parse("claude-haiku-5-5", &reply(r#"{"1":"a","2":"b"}"#, "max_tokens"), 2).is_err());
         assert!(claude_parse("claude-haiku-5-5", &reply("", "refusal"), 2).is_err());
+    }
+
+    fn gemini() -> Gemini {
+        Gemini { http: reqwest::Client::new(), key: "k".into(), model: "gemini-3.5-flash-lite".into(), think_ctl: std::sync::atomic::AtomicBool::new(true) }
+    }
+
+    #[test]
+    fn each_cloud_has_its_name_model_pace_and_ledger() {
+        let dir = std::env::temp_dir().join(format!("tbtr_cl_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Cloud::Claude(Claude::new("k".into()).unwrap());
+        let g = Cloud::Gemini(gemini());
+        assert_eq!((c.name(), c.model()), ("Claude", "claude-haiku-5-5"));
+        assert_eq!((g.name(), g.model()), ("Gemini", "gemini-3.5-flash-lite"));
+        let (pc, pg) = (c.pace(), g.pace());
+        assert_eq!((pc.batch, pc.workers, pc.gap), (10, 4, Duration::ZERO));
+        assert_eq!((pg.batch, pg.workers, pg.gap), (80, 1, Duration::from_millis(4300)));
+        assert!(pg.busy_wait > pc.busy_wait);
+        assert_eq!((c.usage(&dir).limit, g.usage(&dir).limit), (None, Some(500)));
+    }
+
+    #[test]
+    fn picks_the_newest_flash_lite_that_can_write_text() {
+        let m = |n: &str, gen: bool| json!({"name": format!("models/{n}"), "supportedGenerationMethods": if gen { json!(["generateContent"]) } else { json!(["embedContent"]) }});
+        let v = json!({"models": [m("gemini-2.5-flash", true), m("gemini-3.5-flash-lite", true), m("gemini-4.0-flash-lite-preview", true),
+                                  m("gemini-9.0-flash-lite", false), m("gemini-3.0-pro", true), m("gemini-3.0-flash-lite-tts", true)]});
+        assert_eq!(pick_model(&v).unwrap(), "gemini-3.5-flash-lite");
+        assert!(pick_model(&json!({"models": [m("gemini-3.0-pro", true)]})).is_err());
+        assert!(pick_model(&json!({"error": {"message": "API key not valid"}})).is_err());
+    }
+
+    #[test]
+    fn gemini_body_asks_for_a_string_array_and_low_thinking_only_when_allowed() {
+        let b = gemini_body("sys", &["宝贝".to_string()], true);
+        assert_eq!(b["generationConfig"]["thinkingConfig"]["thinkingLevel"], "low");
+        assert_eq!(b["contents"][0]["parts"][0]["text"], r#"["宝贝"]"#);
+        assert!(gemini_body("sys", &[], false)["generationConfig"].get("thinkingConfig").is_none());
+    }
+
+    #[test]
+    fn gemini_replies_map_to_lines_or_the_right_error() {
+        let ok = json!({"candidates": [{"content": {"parts": [{"text": r#"["Товар","Удалить"]"#}]}}]});
+        assert_eq!(gemini_parse(200, &ok, 2).ok().unwrap(), ["Товар", "Удалить"]);
+        assert!(matches!(gemini_parse(200, &ok, 3), Err(CloudErr::Other(_))));
+        let err = |m: &str| json!({"error": {"message": m}});
+        assert!(matches!(gemini_parse(503, &err("overloaded"), 1), Err(CloudErr::Busy)));
+        assert!(matches!(gemini_parse(429, &err("Quota exceeded per minute"), 1), Err(CloudErr::Busy)));
+        assert!(matches!(gemini_parse(429, &err("Quota exceeded ... PerDay"), 1), Err(CloudErr::Off(_))));
+        assert!(matches!(gemini_parse(403, &err(""), 1), Err(CloudErr::Off(m)) if m == "доступ запрещён"));
+        assert!(matches!(gemini_parse(404, &err("no"), 1), Err(CloudErr::Other(_))));
+    }
+
+    #[test]
+    fn key_file_skips_comments_and_the_placeholder() {
+        let dir = std::env::temp_dir().join(format!("tbtr_key_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.key"), "# comment\n\nKEY\n  sk-test-123  \n").unwrap();
+        assert_eq!(read_key(&dir, "x.key").as_deref(), Some("sk-test-123"));
+        std::fs::write(dir.join("y.key"), "# only\nKEY\n").unwrap();
+        assert_eq!(read_key(&dir, "y.key"), None);
+        assert_eq!(read_key(&dir, "missing.key"), None);
+    }
+
+    #[test]
+    fn ledger_line_shows_quota_for_gemini_and_dollars_for_claude() {
+        let dir = std::env::temp_dir().join(format!("tbtr_line_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut g = Usage::load(dir.join("g.json"), PACIFIC, Some(500));
+        g.add(80);
+        assert!(g.line("Gemini").starts_with("Gemini сегодня: 1 из ~500 запросов, 80 строк; сброс через "));
+        let mut c = Usage::load(dir.join("c.json"), TASHKENT, None);
+        c.add(10);
+        c.spend(0.0125);
+        assert_eq!(c.line("Claude"), "Claude сегодня: $0.013 (1 запросов, 10 строк), за месяц $0.01");
+        let again = Usage::load(dir.join("c.json"), TASHKENT, None);
+        assert_eq!((again.requests, again.strings), (1, 10));
     }
 
     #[test]

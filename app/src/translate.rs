@@ -10,7 +10,7 @@ use std::time::Instant;
 pub struct Translator {
     glossary: HashMap<String, String>,
     terms: Vec<String>,
-    rules: Vec<(Regex, fn(&regex::Captures) -> String)>,
+    rules: Vec<Rule>,
     pub cache: HashMap<String, String>,
     cache_path: PathBuf,
     review_path: PathBuf,
@@ -44,29 +44,7 @@ impl Translator {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
-        let rules: Vec<(Regex, fn(&regex::Captures) -> String)> = vec![
-            (Regex::new(r"^已售\s*([\d.]+)(万)?(\+)?\s*件?$").unwrap(), |c| {
-                let n = if c.get(2).is_some() { format!("{} тыс.", wan(&c[1])) } else { c[1].to_string() };
-                format!("Продано {}{}", n, c.get(3).map_or("", |_| "+"))
-            }),
-            (Regex::new(r"^([\d.]+)万(\+)?$").unwrap(), |c| format!("{} тыс.{}", wan(&c[1]), c.get(2).map_or("", |_| "+"))),
-            (Regex::new(r"^([\d.]+)(万)?\+?人(付款|购买|收货)$").unwrap(), |c| {
-                let n = if c.get(2).is_some() { format!("{} тыс.", wan(&c[1])) } else { c[1].to_string() };
-                format!("{}+ купили", n)
-            }),
-            (Regex::new(r"^满(\d+)减(\d+)$").unwrap(), |c| format!("−{} при покупке от {}", &c[2], &c[1])),
-            (Regex::new(r"^满(\d+)元减(\d+)元$").unwrap(), |c| format!("−¥{} при покупке от ¥{}", &c[2], &c[1])),
-            (Regex::new(r"^再赚(\d+)淘金币可低至([\d.]+)元$").unwrap(), |c| format!("Ещё {} Таобао-монет — цена от ¥{}", &c[1], &c[2])),
-            (Regex::new(r"^官方立减(\d+)%$").unwrap(), |c| format!("Скидка Taobao {}%", &c[1])),
-            (Regex::new(r"^立减(\d+)%$").unwrap(), |c| format!("Скидка {}%", &c[1])),
-            (Regex::new(r"^逛(\d+)个商品\((\d+)/(\d+)\)$").unwrap(), |c| format!("Посмотреть {} товара ({}/{})", &c[1], &c[2], &c[3])),
-            (Regex::new(r"^([\d.]+)元$").unwrap(), |c| format!("¥{}", &c[1])),
-            (Regex::new(r"^共(\d+)件$").unwrap(), |c| format!("Всего {} шт.", &c[1])),
-            (Regex::new(r"^(\d+)件$").unwrap(), |c| format!("{} шт.", &c[1])),
-            (Regex::new(r"^(\d+)天$").unwrap(), |c| format!("{} дн.", &c[1])),
-            (Regex::new(r"^(\d+)小时$").unwrap(), |c| format!("{} ч", &c[1])),
-            (Regex::new(r"^(\d+)分钟$").unwrap(), |c| format!("{} мин", &c[1])),
-        ];
+        let rules = rules();
 
         Ok(Self {
             glossary,
@@ -124,50 +102,23 @@ impl Translator {
         if total_cjk < 4 {
             return None;
         }
-        let mut parts: Vec<String> = Vec::new();
-        let mut covered = 0;
+        let mut d = Draft::default();
         let mut i = 0;
-        let mut latin = String::new();
         while i < chars.len() {
-            let c = chars[i];
-            if !is_cjk(c) {
-                if c.is_ascii_alphanumeric() || (!latin.is_empty() && matches!(c, '.' | '-' | '+')) {
-                    latin.push(c);
-                } else if !latin.is_empty() {
-                    parts.push(std::mem::take(&mut latin));
-                }
-                i += 1;
-                continue;
-            }
-            if !latin.is_empty() {
-                parts.push(std::mem::take(&mut latin));
-            }
-            let mut best = None;
-            for len in (2..=8.min(chars.len() - i)).rev() {
-                let w: String = chars[i..i + len].iter().collect();
-                if let Some(v) = self.glossary.get(&w) {
-                    best = Some((len, v.clone()));
-                    break;
-                }
-            }
-            match best {
-                Some((len, v)) => {
-                    if !v.is_empty() && !parts.contains(&v) {
-                        parts.push(v);
-                    }
-                    covered += len;
-                    i += len;
-                }
-                None => i += 1,
-            }
+            i += match (is_cjk(chars[i]), self.longest_term(&chars, i)) {
+                (false, _) => d.other(chars[i]),
+                (true, Some((len, v))) => d.term(len, v),
+                (true, None) => d.unknown(),
+            };
         }
-        if !latin.is_empty() {
-            parts.push(latin);
-        }
-        if covered * 100 / total_cjk < 35 || parts.is_empty() {
-            return None;
-        }
-        Some(format!("{} …", parts.join(" · ")))
+        d.finish(total_cjk)
+    }
+
+    fn longest_term(&self, chars: &[char], i: usize) -> Option<(usize, &String)> {
+        (2..=8.min(chars.len() - i)).rev().find_map(|len| {
+            let w: String = chars[i..i + len].iter().collect();
+            self.glossary.get(&w).map(|v| (len, v))
+        })
     }
 
     pub fn client(&self) -> (reqwest::Client, String) {
@@ -226,45 +177,32 @@ impl Translator {
 
     pub fn remember(&mut self, zh: &str, ru: &str, ms: u128, src: &str) {
         self.cache.insert(zh.to_string(), ru.to_string());
-        if let Some((key, times)) = mask_clock(zh) {
-            let mut t = ru.to_string();
-            if times.iter().all(|x| t.contains(x.as_str())) {
-                for x in &times {
-                    t = t.replacen(x.as_str(), CLOCK, 1);
-                }
-                self.cache.insert(key, t);
-            }
+        if let Some((key, t)) = clock_template(zh, ru) {
+            self.cache.insert(key, t);
         }
         self.dirty += 1;
-
-        let mut flags = Vec::new();
-        if ru.chars().any(is_cjk) {
-            flags.push("остался китайский");
-        }
-        if self.pinyin_translit.is_match(ru) {
-            flags.push("транслит");
-        }
-        let zh_latin: String = zh.chars().filter(|c| c.is_ascii_alphabetic()).collect::<String>().to_lowercase();
-        if self.latin_word.find_iter(ru).any(|m| !zh_latin.contains(&m.as_str().to_lowercase())) {
-            flags.push("латиница не из оригинала");
-        }
-        let (lz, lr) = (zh.chars().count(), ru.chars().count());
-        if lz >= 4 && lr > lz * 7 {
-            flags.push("слишком длинно");
-        }
-
-        let line = json!({"zh": zh, "ru": ru, "ms": ms, "src": src, "flags": flags});
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.review_path) {
-            let _ = writeln!(f, "{}", line);
-        }
+        let flags = self.flags(zh, ru);
+        append(&self.review_path, &json!({"zh": zh, "ru": ru, "ms": ms, "src": src, "flags": flags}).to_string());
         if !flags.is_empty() {
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&self.strange_path) {
-                let _ = writeln!(f, "{}\t{}\t{}\t{}", zh, ru.replace(['\t', '\n'], " "), flags.join(", "), src);
-            }
+            append(&self.strange_path, &format!("{}\t{}\t{}\t{}", zh, ru.replace(['\t', '\n'], " "), flags.join(", "), src));
         }
         if self.dirty >= 10 {
             self.save();
         }
+    }
+
+    fn flags(&self, zh: &str, ru: &str) -> Vec<&'static str> {
+        let zh_latin = zh.chars().filter(|c| c.is_ascii_alphabetic()).collect::<String>().to_lowercase();
+        let (lz, lr) = (zh.chars().count(), ru.chars().count());
+        [
+            (ru.chars().any(is_cjk), "остался китайский"),
+            (self.pinyin_translit.is_match(ru), "транслит"),
+            (self.latin_word.find_iter(ru).any(|m| !zh_latin.contains(&m.as_str().to_lowercase())), "латиница не из оригинала"),
+            (lz >= 4 && lr > lz * 7, "слишком длинно"),
+        ]
+        .into_iter()
+        .filter_map(|(hit, name)| hit.then_some(name))
+        .collect()
     }
 
     pub fn save(&mut self) {
@@ -291,7 +229,99 @@ pub fn is_cjk(c: char) -> bool {
     ('\u{3400}'..='\u{9fff}').contains(&c)
 }
 
+#[derive(Default)]
+struct Draft {
+    parts: Vec<String>,
+    latin: String,
+    covered: usize,
+}
+
+impl Draft {
+    fn flush(&mut self) {
+        if !self.latin.is_empty() {
+            self.parts.push(std::mem::take(&mut self.latin));
+        }
+    }
+
+    fn other(&mut self, c: char) -> usize {
+        if c.is_ascii_alphanumeric() || (!self.latin.is_empty() && matches!(c, '.' | '-' | '+')) {
+            self.latin.push(c);
+        } else {
+            self.flush();
+        }
+        1
+    }
+
+    fn term(&mut self, len: usize, v: &str) -> usize {
+        self.flush();
+        if !v.is_empty() && !self.parts.iter().any(|p| p == v) {
+            self.parts.push(v.to_string());
+        }
+        self.covered += len;
+        len
+    }
+
+    fn unknown(&mut self) -> usize {
+        self.flush();
+        1
+    }
+
+    fn finish(mut self, total_cjk: usize) -> Option<String> {
+        self.flush();
+        if self.covered * 100 / total_cjk < 35 || self.parts.is_empty() {
+            return None;
+        }
+        Some(format!("{} …", self.parts.join(" · ")))
+    }
+}
+
 const CLOCK: &str = "⏱";
+
+fn append(path: &Path, line: &str) {
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+fn clock_template(zh: &str, ru: &str) -> Option<(String, String)> {
+    let (key, times) = mask_clock(zh)?;
+    if !times.iter().all(|x| ru.contains(x.as_str())) {
+        return None;
+    }
+    let t = times.iter().fold(ru.to_string(), |t, x| t.replacen(x.as_str(), CLOCK, 1));
+    Some((key, t))
+}
+
+fn count(c: &regex::Captures, n: usize, wan_at: usize) -> String {
+    c.get(wan_at).map_or_else(|| c[n].to_string(), |_| format!("{} тыс.", wan(&c[n])))
+}
+
+fn plus(c: &regex::Captures, at: usize) -> &'static str {
+    c.get(at).map_or("", |_| "+")
+}
+
+type Rule = (Regex, fn(&regex::Captures) -> String);
+
+fn rules() -> Vec<Rule> {
+    let r = |p: &str| Regex::new(p).unwrap();
+    vec![
+        (r(r"^已售\s*([\d.]+)(万)?(\+)?\s*件?$"), |c| format!("Продано {}{}", count(c, 1, 2), plus(c, 3))),
+        (r(r"^([\d.]+)万(\+)?$"), |c| format!("{} тыс.{}", wan(&c[1]), plus(c, 2))),
+        (r(r"^([\d.]+)(万)?\+?人(付款|购买|收货)$"), |c| format!("{}+ купили", count(c, 1, 2))),
+        (r(r"^满(\d+)减(\d+)$"), |c| format!("−{} при покупке от {}", &c[2], &c[1])),
+        (r(r"^满(\d+)元减(\d+)元$"), |c| format!("−¥{} при покупке от ¥{}", &c[2], &c[1])),
+        (r(r"^再赚(\d+)淘金币可低至([\d.]+)元$"), |c| format!("Ещё {} Таобао-монет — цена от ¥{}", &c[1], &c[2])),
+        (r(r"^官方立减(\d+)%$"), |c| format!("Скидка Taobao {}%", &c[1])),
+        (r(r"^立减(\d+)%$"), |c| format!("Скидка {}%", &c[1])),
+        (r(r"^逛(\d+)个商品\((\d+)/(\d+)\)$"), |c| format!("Посмотреть {} товара ({}/{})", &c[1], &c[2], &c[3])),
+        (r(r"^([\d.]+)元$"), |c| format!("¥{}", &c[1])),
+        (r(r"^共(\d+)件$"), |c| format!("Всего {} шт.", &c[1])),
+        (r(r"^(\d+)件$"), |c| format!("{} шт.", &c[1])),
+        (r(r"^(\d+)天$"), |c| format!("{} дн.", &c[1])),
+        (r(r"^(\d+)小时$"), |c| format!("{} ч", &c[1])),
+        (r(r"^(\d+)分钟$"), |c| format!("{} мин", &c[1])),
+    ]
+}
 
 fn search_key(ru: &str) -> String {
     format!("поиск:{}", ru.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase())
@@ -323,11 +353,108 @@ mod tests {
     use super::*;
 
     fn tr() -> Translator {
+        tr_with("{}")
+    }
+
+    fn tr_with(glossary: &str) -> Translator {
         let dir = std::env::temp_dir().join(format!("tbtr_tr_{}_{:?}", std::process::id(), std::thread::current().id()));
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("glossary.json"), "{}").unwrap();
+        fs::write(dir.join("glossary.json"), glossary).unwrap();
         let _ = fs::remove_file(dir.join("cache.json"));
         Translator::load(&dir, "http://127.0.0.1:1").unwrap()
+    }
+
+    const G: &str = r#"{"马丁靴": "мартинсы", "男士": "мужские", "新款": "новинка", "宝贝": "товар", "亲": ""}"#;
+
+    #[test]
+    fn number_rules_translate_counts_discounts_and_times() {
+        let t = tr();
+        let cases = [
+            ("已售65件", "Продано 65"),
+            ("已售 2.5万+件", "Продано 25 тыс.+"),
+            ("14万+", "140 тыс.+"),
+            ("3万", "30 тыс."),
+            ("600+人付款", "600+ купили"),
+            ("1.2万人收货", "12 тыс.+ купили"),
+            ("满3减1", "−1 при покупке от 3"),
+            ("满200元减20元", "−¥20 при покупке от ¥200"),
+            ("再赚185淘金币可低至83.0元", "Ещё 185 Таобао-монет — цена от ¥83.0"),
+            ("官方立减15%", "Скидка Taobao 15%"),
+            ("立减5%", "Скидка 5%"),
+            ("逛3个商品(0/3)", "Посмотреть 3 товара (0/3)"),
+            ("59.9元", "¥59.9"),
+            ("共4件", "Всего 4 шт."),
+            ("4件", "4 шт."),
+            ("7天", "7 дн."),
+            ("12小时", "12 ч"),
+            ("30分钟", "30 мин"),
+        ];
+        for (zh, ru) in cases {
+            assert_eq!(fast(&t, zh).as_deref(), Some(ru), "{zh}");
+        }
+    }
+
+    #[test]
+    fn strange_translations_are_flagged_for_review() {
+        let t = tr();
+        assert!(t.flags("宝贝", "Товар").is_empty());
+        assert_eq!(t.flags("宝贝", "Товар 宝"), ["остался китайский"]);
+        assert_eq!(t.flags("莆田鞋", "Путянь цзы"), ["транслит"]);
+        assert_eq!(t.flags("耳机", "Наушники Apple"), ["латиница не из оригинала"]);
+        assert!(t.flags("苹果Apple耳机", "Наушники Apple").is_empty());
+        assert_eq!(t.flags("新款上市", &"очень ".repeat(6)), ["слишком длинно"]);
+    }
+
+    #[test]
+    fn cache_is_saved_and_loaded_back() {
+        let mut t = tr();
+        t.save();
+        assert!(!t.cache_path.exists(), "nothing new, nothing written");
+        t.remember("别的", "Другое", 1, "cloud");
+        t.save();
+        let again = Translator::load(t.cache_path.parent().unwrap(), "http://127.0.0.1:1").unwrap();
+        assert_eq!(again.cache.get("别的").map(String::as_str), Some("Другое"));
+        assert_eq!(t.dirty, 0);
+    }
+
+    #[test]
+    fn remember_logs_every_answer_and_the_strange_ones_separately() {
+        let mut t = tr();
+        let _ = fs::remove_file(&t.review_path);
+        let _ = fs::remove_file(&t.strange_path);
+        t.remember("宝贝", "Товар", 5, "cloud");
+        t.remember("耳机", "Наушники Apple", 6, "local");
+        let review = fs::read_to_string(&t.review_path).unwrap();
+        assert_eq!(review.lines().count(), 2);
+        let strange = fs::read_to_string(&t.strange_path).unwrap();
+        assert_eq!(strange, "耳机\tНаушники Apple\tлатиница не из оригинала\tlocal\n");
+    }
+
+    #[test]
+    fn draft_strings_known_words_together() {
+        let t = tr_with(G);
+        assert_eq!(t.draft("马丁靴男士2025新款").as_deref(), Some("мартинсы · мужские · 2025 · новинка …"));
+        assert_eq!(t.draft("马丁靴 iPhone-15 男士").as_deref(), Some("мартинсы · iPhone-15 · мужские …"));
+        assert_eq!(t.draft("男士马丁皮靴高帮"), None, "less than 35% of the Chinese is known");
+        assert_eq!(t.draft("马丁靴"), None, "too short for a draft");
+        assert_eq!(t.draft("男士男士宝贝").as_deref(), Some("мужские · товар …"));
+    }
+
+    #[test]
+    fn prompt_adds_known_terms_and_uses_the_catalog_form_for_titles() {
+        let t = tr_with(G);
+        assert_eq!(t.prompt("删除"), "把下面的文本翻译成俄语，不要额外解释。\n\n删除");
+        assert!(t.prompt("男士专区").starts_with("参考下面的翻译：\n男士 翻译成 мужские\n\n把下面的文本翻译成俄语"));
+        let title = "马丁靴男士2025冬季加绒保暖高帮切尔西靴英伦风";
+        assert!(t.prompt(title).contains("译成简短的俄语商品目录名称"));
+        assert!(!t.prompt("增值电信业务经营许可证：浙B2-20080224-1号码号码").contains("商品目录"), "licences are not product titles");
+    }
+
+    #[test]
+    fn terms_for_lists_glossary_words_found_in_the_batch_longest_first() {
+        let t = tr_with(G);
+        let got = t.terms_for(&["马丁靴男士".to_string(), "删除".to_string()]);
+        assert_eq!(got, [("马丁靴".to_string(), "мартинсы".to_string()), ("男士".to_string(), "мужские".to_string())]);
     }
 
     fn fast(t: &Translator, s: &str) -> Option<String> {

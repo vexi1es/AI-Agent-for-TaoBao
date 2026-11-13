@@ -22,16 +22,17 @@ impl Default for Settings {
     }
 }
 
+fn cbu_rate(v: &Value, ccy: &str) -> Option<(f64, String)> {
+    let x = v.as_array()?.iter().find(|x| x["Ccy"] == ccy)?;
+    let nominal: f64 = x["Nominal"].as_str().unwrap_or("1").parse().ok()?;
+    let r: f64 = x["Rate"].as_str()?.parse().ok()?;
+    Some((r / nominal, x["Date"].as_str().unwrap_or("").to_string()))
+}
+
 pub fn parse_cbu(json: &str) -> Result<Rates> {
     let v: Value = serde_json::from_str(json)?;
-    let rate = |ccy: &str| -> Option<(f64, String)> {
-        let x = v.as_array()?.iter().find(|x| x["Ccy"] == ccy)?;
-        let nominal: f64 = x["Nominal"].as_str().unwrap_or("1").parse().ok()?;
-        let r: f64 = x["Rate"].as_str()?.parse().ok()?;
-        Some((r / nominal, x["Date"].as_str().unwrap_or("").to_string()))
-    };
-    let (cny, date) = rate("CNY").ok_or_else(|| anyhow!("нет курса юаня"))?;
-    let (usd, _) = rate("USD").ok_or_else(|| anyhow!("нет курса доллара"))?;
+    let (cny, date) = cbu_rate(&v, "CNY").ok_or_else(|| anyhow!("нет курса юаня"))?;
+    let (usd, _) = cbu_rate(&v, "USD").ok_or_else(|| anyhow!("нет курса доллара"))?;
     Ok(Rates { uzs_per_cny: cny, uzs_per_usd: usd, date })
 }
 
