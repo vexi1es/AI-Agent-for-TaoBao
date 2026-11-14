@@ -20,6 +20,7 @@ pub struct Translator {
     model_url: String,
     pinyin_translit: Regex,
     latin_word: Regex,
+    rubles: Regex,
 }
 
 pub enum Hit {
@@ -59,6 +60,7 @@ impl Translator {
             model_url: model_url.to_string(),
             pinyin_translit: Regex::new(r"(?i)(цз|сюн|сюй|сяо|чж|чэн|ньс|бэй|хуэй|юнь|жэнь|цю|ця|цзя|ли?нь|гуань|чуань|шэн|дзы|цзы)").unwrap(),
             latin_word: Regex::new(r"[A-Za-z]{4,}").unwrap(),
+            rubles: Regex::new(r"(\d[\d.,]*)\s*₽").unwrap(),
         })
     }
 
@@ -175,7 +177,8 @@ impl Translator {
         self.dirty += 1;
     }
 
-    pub fn remember(&mut self, zh: &str, ru: &str, ms: u128, src: &str) {
+    pub fn remember(&mut self, zh: &str, ru: &str, ms: u128, src: &str) -> String {
+        let ru = &self.rubles.replace_all(ru, "¥$1").into_owned();
         self.cache.insert(zh.to_string(), ru.to_string());
         if let Some((key, t)) = clock_template(zh, ru) {
             self.cache.insert(key, t);
@@ -189,6 +192,7 @@ impl Translator {
         if self.dirty >= 10 {
             self.save();
         }
+        ru.to_string()
     }
 
     fn flags(&self, zh: &str, ru: &str) -> Vec<&'static str> {
@@ -478,6 +482,15 @@ mod tests {
         let again = Translator::load(t.cache_path.parent().unwrap(), "http://127.0.0.1:1").unwrap();
         assert_eq!(again.cache.get("别的").map(String::as_str), Some("Другое"));
         assert_eq!(t.dirty, 0);
+    }
+
+    #[test]
+    fn yuan_amounts_never_turn_into_rubles() {
+        let mut t = tr();
+        assert_eq!(t.remember("官方立减30元", "Скидка Taobao 30 ₽", 1, "cloud"), "Скидка Taobao ¥30");
+        assert_eq!(t.cache.get("官方立减30元").map(String::as_str), Some("Скидка Taobao ¥30"));
+        assert_eq!(t.remember("淘金币抵1.5元", "Таобао-монеты: скидка 1,5 ₽", 1, "cloud"), "Таобао-монеты: скидка ¥1,5");
+        assert_eq!(t.remember("别的", "Другое", 1, "cloud"), "Другое");
     }
 
     #[test]

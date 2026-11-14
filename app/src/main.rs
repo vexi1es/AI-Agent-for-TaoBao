@@ -280,7 +280,7 @@ impl State {
     fn done(&mut self, results: &[(String, String)], ms: u128, src: &str) -> HashMap<String, HashMap<String, String>> {
         let mut per_session: HashMap<String, HashMap<String, String>> = HashMap::new();
         for (zh, ru) in results {
-            self.tr.remember(zh, ru, ms, src);
+            let ru = self.tr.remember(zh, ru, ms, src);
             self.in_flight.remove(zh);
             for s in self.subs.remove(zh).unwrap_or_default() {
                 per_session.entry(s).or_default().insert(zh.clone(), ru.clone());

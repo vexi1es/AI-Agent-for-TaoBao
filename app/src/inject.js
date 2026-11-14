@@ -36,6 +36,23 @@
     return v > 0 ? v : null;
   }
 
+  const DIGITS = /^[\d.,\s]+$/;
+  const YUAN = /^\s*[¥￥]\s*$/;
+
+  function splitPrice(e) {
+    if (!e || own(e)) return null;
+    let start = e;
+    while (start && DIGITS.test(start.textContent)) start = start.previousElementSibling;
+    if (!start || !YUAN.test(start.textContent)) return null;
+    let digits = "", last = null;
+    for (let x = start.nextElementSibling; x && !own(x) && DIGITS.test(x.textContent); x = x.nextElementSibling) {
+      digits += x.textContent;
+      last = x;
+    }
+    const v = last && parseFloat(digits.replace(/[\s,]/g, ""));
+    return v > 0 ? { el: last, v } : null;
+  }
+
   function annotate(n) {
     if (!CFG.uzsPerCny) return;
     let el = null, v = null;
@@ -44,7 +61,11 @@
       const x = priceOf(p);
       if (x != null) { el = p; v = x; break; }
     }
-    if (!el) return;
+    if (!el) {
+      const split = splitPrice(n.parentElement);
+      if (!split) return;
+      el = split.el; v = split.v;
+    }
     const text = "· " + fmtSum(v * CFG.uzsPerCny);
     let s = priced.get(el);
     if (s && s.isConnected) { if (s.textContent !== text) s.textContent = text; return; }
@@ -187,7 +208,7 @@
   function groupOf(n) {
     let cand = null;
     for (let p = n.parentElement, i = 0; p && i < 3; p = p.parentElement, i++) {
-      if (!allInline(p)) break;
+      if (!allInline(p) || /[¥￥]/.test(p.textContent)) break;
       if (textNodes(p).filter(t => t.nodeValue.trim()).length >= 2) cand = p;
     }
     return cand;

@@ -50,6 +50,15 @@ test("a yuan price gets its price in soums next to it", async () => {
   assert.match(doc.body.textContent, /2 154 700 сум/);
 });
 
+test("a card price split into yuan sign, number and sales keeps its price and gets soums", async () => {
+  const { doc, sent } = page('<div class=price-wrapper><span>¥</span><span id=v>49</span><span id=s>52人付款</span></div>');
+  await until(() => keysOf(sent).length > 0);
+  await tick(50);
+  assert.deepEqual(keysOf(sent), ["52人付款"], "the sales count is translated on its own, the price is not sent");
+  assert.equal(doc.getElementById("v").textContent, "49");
+  assert.equal(doc.getElementById("v").nextElementSibling.textContent, "· 88 000 сум");
+});
+
 test("a price is annotated once even when the page changes around it", async () => {
   const { doc } = page("<div id=p>¥22</div>");
   await tick(50);
