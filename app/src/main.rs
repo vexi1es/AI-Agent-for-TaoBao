@@ -1121,6 +1121,11 @@ mod tests {
         assert_eq!(q.pick_one().as_deref(), Some("短"), "shortest visible first");
         assert_eq!(q.pick_batch(5), strings(&["长长长长", "下面"]));
         assert_eq!(q.pick_one(), None);
+        for s in ["一", "二", "三"] {
+            q.push(s, false);
+        }
+        assert_eq!(q.pick_batch(2), strings(&["一", "二"]), "a batch is never bigger than asked");
+        assert_eq!(q.len(), 1);
     }
 
     #[test]
@@ -1166,6 +1171,9 @@ mod tests {
         assert_eq!(per["a"]["别的"], "Другое");
         assert!(st.in_flight.is_empty());
         assert_eq!(st.stats, (1, 0));
+        st.done(&[("一".into(), "1".into()), ("二".into(), "2".into())], 5, "cloud");
+        st.done(&[("三".into(), "3".into()), ("四".into(), "4".into())], 5, "local");
+        assert_eq!(st.stats, (3, 2), "cloud and local counts add up");
         assert!(matches!(st.tr.fast("别的"), Hit::Fast(t) if t == "Другое"));
     }
 
@@ -1259,6 +1267,12 @@ mod tests {
         assert_eq!(item_key("https://item.taobao.com/item.htm?spm=a&id=611830625730&ns=1"), "611830625730");
         assert_eq!(item_key("https://detail.tmall.com/item.htm?id=42#reviews"), "42");
         assert_eq!(item_key("bench/item_boots.txt#x"), "bench/item_boots.txt");
+    }
+
+    #[test]
+    fn pages_get_the_real_page_script() {
+        assert!(script().contains("window.__tbtr = {"));
+        assert!(script().contains("__tbtr_item_done"));
     }
 
     #[test]
