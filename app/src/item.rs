@@ -202,6 +202,34 @@ mod tests {
     }
 
     #[test]
+    fn the_answer_form_requires_every_field() {
+        let s = schema();
+        let mut req: Vec<&str> = s["required"].as_array().unwrap().iter().map(|x| x.as_str().unwrap()).collect();
+        req.sort();
+        assert_eq!(req, ["banned", "complaints", "grade", "price_cny", "weight_basis", "weight_g", "why"]);
+        assert_eq!(s["properties"]["grade"]["enum"], json!(["good", "ok", "bad"]));
+        assert_eq!(s["additionalProperties"], false);
+    }
+
+    #[test]
+    fn zero_weight_or_zero_price_mean_unknown() {
+        let mut b = reply();
+        b["weight_g"] = json!(0);
+        assert!(parse_verdict(&b).is_err());
+        let mut b = reply();
+        b["price_cny"] = json!(0);
+        assert_eq!(parse_verdict(&b).unwrap().price_cny, None);
+    }
+
+    #[test]
+    fn chinese_shared_by_the_ban_and_the_text_is_listed_once() {
+        let mut b = reply();
+        b["complaints"] = json!("磁铁 мешает");
+        b["banned"] = json!("внутри 磁铁 и 电池");
+        assert_eq!(parse_verdict(&b).unwrap().chinese_left(), ["磁铁", "电池"]);
+    }
+
+    #[test]
     fn rejects_an_unknown_grade_or_a_silly_weight() {
         let mut b = reply();
         b["grade"] = json!("great");

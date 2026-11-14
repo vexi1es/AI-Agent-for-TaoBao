@@ -221,8 +221,8 @@ impl Translator {
 
 fn wan(n: &str) -> String {
     let v: f64 = n.parse().unwrap_or(0.0);
-    let t = v * 10.0;
-    if (t - t.round()).abs() < 1e-9 { format!("{}", t as i64) } else { format!("{:.1}", t) }
+    let s = format!("{:.1}", v * 10.0);
+    s.strip_suffix(".0").map(String::from).unwrap_or(s)
 }
 
 pub fn is_cjk(c: char) -> bool {
@@ -387,6 +387,48 @@ mod tests {
     }
 
     #[test]
+    fn draft_needs_at_least_35_percent_known() {
+        let t = tr_with(G);
+        let unknown13 = "一二三四五六七八九十百千万";
+        assert!(t.draft(&format!("马丁靴男士新款{unknown13}")).is_some(), "7 of 20 is exactly 35%");
+        assert!(t.draft(&format!("马丁靴男士新款{unknown13}亿")).is_none(), "7 of 21 is less");
+    }
+
+    #[test]
+    fn unknown_chinese_separates_latin_words() {
+        assert_eq!(tr_with(G).draft("AB未CD男士新款").as_deref(), Some("AB · CD · мужские · новинка …"));
+    }
+
+    #[test]
+    fn different_searches_do_not_share_a_cache_entry() {
+        let mut t = tr();
+        t.remember_search("сумка", "包", "сумка");
+        assert_eq!(t.search_cached("ботинки"), None);
+        t.save();
+        let again = Translator::load(t.cache_path.parent().unwrap(), "http://127.0.0.1:1").unwrap();
+        assert_eq!(again.search_cached("сумка"), Some(("包".to_string(), "сумка".to_string())), "a search alone is worth saving");
+    }
+
+    #[test]
+    fn cache_saves_itself_every_ten_new_answers() {
+        let mut t = tr();
+        for i in 0..9 {
+            t.remember(&format!("字{i}"), "x", 1, "cloud");
+        }
+        assert!(!t.cache_path.exists());
+        t.remember("字9", "x", 1, "cloud");
+        assert!(t.cache_path.exists());
+    }
+
+    #[test]
+    fn too_long_means_more_than_seven_times_the_chinese() {
+        let t = tr();
+        assert!(t.flags("新款上市", &"я".repeat(28)).is_empty());
+        assert_eq!(t.flags("新款上市", &"я".repeat(29)), ["слишком длинно"]);
+        assert!(t.flags("新款上", &"я".repeat(40)).is_empty(), "short lines are never too long");
+    }
+
+    #[test]
     fn number_rules_translate_counts_discounts_and_times() {
         let t = tr();
         let cases = [
@@ -394,6 +436,7 @@ mod tests {
             ("已售 2.5万+件", "Продано 25 тыс.+"),
             ("14万+", "140 тыс.+"),
             ("3万", "30 тыс."),
+            ("1.25万", "12.5 тыс."),
             ("600+人付款", "600+ купили"),
             ("1.2万人收货", "12 тыс.+ купили"),
             ("满3减1", "−1 при покупке от 3"),

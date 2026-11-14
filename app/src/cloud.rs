@@ -532,6 +532,7 @@ mod tests {
         let m = |n: &str| json!({"name": format!("models/{n}"), "supportedGenerationMethods": ["generateContent"]});
         assert_eq!(pick_model(&json!({"models": [m("gemini-2.5-flash-lite"), m("gemini-3.5-flash-lite"), m("gemini-3.0-flash-lite")]})).unwrap(), "gemini-3.5-flash-lite");
         assert_eq!(pick_model(&json!({"models": [m("gemini-2.5-flash"), m("gemini-3.0-flash")]})).unwrap(), "gemini-3.0-flash");
+        assert_eq!(pick_model(&json!({"models": [m("gemini-3.0-flash-lite"), m("gemini-3.5-flash-lite")]})).unwrap(), "gemini-3.5-flash-lite");
     }
 
     #[test]
@@ -583,6 +584,8 @@ mod tests {
         let mut g = Usage::load(dir.join("g.json"), PACIFIC, Some(500));
         g.add(80);
         assert!(g.line("Gemini").starts_with("Gemini сегодня: 1 из ~500 запросов, 80 строк; сброс через "));
+        let left = g.until_reset();
+        assert!(left > Duration::ZERO && left <= Duration::from_secs(86_400), "{left:?}");
         let mut c = Usage::load(dir.join("c.json"), TASHKENT, None);
         c.add(10);
         c.spend(0.0125);

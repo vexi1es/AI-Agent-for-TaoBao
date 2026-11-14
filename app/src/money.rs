@@ -161,6 +161,26 @@ mod tests {
         assert_eq!(civil(20_453), (2025, 12, 31));
         assert_eq!(civil(20_454), (2026, 1, 1));
         assert_eq!(civil(11_016), (2000, 2, 29));
+        for (day, date) in [(47_540, (2100, 2, 28)), (47_541, (2100, 3, 1)), (157_113, (2400, 2, 29)), (157_114, (2400, 3, 1)), (47_481, (2099, 12, 31)), (157_419, (2400, 12, 31))] {
+            assert_eq!(civil(day), date, "{day}");
+        }
+    }
+
+    #[test]
+    fn rates_quoted_per_ten_or_hundred_units_are_divided() {
+        let r = parse_cbu(r#"[{"Ccy":"CNY","Rate":"17955.8","Nominal":"10","Date":"d"},{"Ccy":"USD","Rate":"11973.44","Date":"d"}]"#).unwrap();
+        assert!((r.uzs_per_cny - 1795.58).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_or_negative_markup_falls_back_to_none() {
+        let dir = std::env::temp_dir().join(format!("tbtr_mk_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"markup": 0, "cargo_usd_per_kg": 0}"#).unwrap();
+        let s = Settings::load(&dir);
+        assert_eq!((s.markup, s.cargo_usd_per_kg), (1.0, 0.0), "free cargo is allowed, a free product is not");
+        std::fs::write(dir.join("settings.json"), r#"{"markup": 1.05}"#).unwrap();
+        assert_eq!(Settings::load(&dir).markup, 1.05);
     }
 
     #[test]
