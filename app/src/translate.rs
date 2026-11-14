@@ -364,7 +364,27 @@ mod tests {
         Translator::load(&dir, "http://127.0.0.1:1").unwrap()
     }
 
-    const G: &str = r#"{"马丁靴": "мартинсы", "男士": "мужские", "新款": "новинка", "宝贝": "товар", "亲": ""}"#;
+    const G: &str = r#"{"马丁靴": "мартинсы", "男士": "мужские", "新款": "новинка", "宝贝": "товар", "亲": "", "张": "шт.", "亲亲": ""}"#;
+
+    #[test]
+    fn one_letter_and_empty_words_are_not_hints_for_the_model() {
+        let t = tr_with(G);
+        assert!(t.terms_for(&["一张亲亲纸".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn titles_are_long_lines_that_are_not_licences() {
+        assert!(!Translator::is_title(&"字".repeat(20)));
+        assert!(Translator::is_title(&"字".repeat(21)));
+        for mark in ["证", "许可", "备案", "："] {
+            assert!(!Translator::is_title(&format!("{}{mark}", "字".repeat(21))), "{mark}");
+        }
+    }
+
+    #[test]
+    fn four_known_characters_are_enough_for_a_draft() {
+        assert_eq!(tr_with(G).draft("男士新款").as_deref(), Some("мужские · новинка …"));
+    }
 
     #[test]
     fn number_rules_translate_counts_discounts_and_times() {

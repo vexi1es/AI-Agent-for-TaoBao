@@ -410,13 +410,6 @@ async fn idle(wake: &Notify) {
     let _ = tokio::time::timeout(Duration::from_millis(500), wake.notified()).await;
 }
 
-fn off_pause(cloud: &Cloud, usage: &std::sync::Mutex<Usage>) -> Duration {
-    match cloud {
-        Cloud::Gemini(_) => usage.lock().unwrap().until_reset() + Duration::from_secs(120),
-        Cloud::Claude(_) => Duration::from_secs(1800),
-    }
-}
-
 async fn cloud_worker(state: Shared, cdp: Arc<Cdp>, wake: Arc<Notify>, cloud: Arc<Cloud>, rank: usize, usage: Arc<std::sync::Mutex<Usage>>) {
     let pace = cloud.pace();
     let mut last = Instant::now() - pace.gap;
@@ -431,7 +424,7 @@ async fn cloud_worker(state: Shared, cdp: Arc<Cdp>, wake: Arc<Notify>, cloud: Ar
         match cloud.translate(&batch, &terms).await {
             Ok(done) => cloud_done(&state, &cdp, &cloud, &usage, batch, done, last.elapsed().as_millis()).await,
             Err(e) => {
-                let pause = off_pause(&cloud, &usage);
+                let pause = cloud.off_pause(&usage.lock().unwrap());
                 let after = state.lock().await.cloud_failed(rank, batch, &e, pause, pace.busy_wait);
                 report_failure(&state, &cloud, &e, pause).await;
                 wake.notify_waiters();
@@ -1281,15 +1274,6 @@ mod tests {
         let s = money::Settings { markup: 1.5, ..money::Settings::default() };
         assert_eq!(page_config(Some(&r), &s), r#"window.__tbtr_cfg={"uzsPerCny":2700.0};"#);
         assert_eq!(page_config(None, &s), "window.__tbtr_cfg={};");
-    }
-
-    #[test]
-    fn switched_off_claude_waits_half_an_hour_and_gemini_until_its_quota_resets() {
-        let dir = std::env::temp_dir().join(format!("tbtr_op_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let c = Cloud::Claude(Claude::new("k".into()).unwrap());
-        let u = std::sync::Mutex::new(c.usage(&dir));
-        assert_eq!(off_pause(&c, &u), Duration::from_secs(1800));
     }
 
     fn args(v: &[&str]) -> Args {

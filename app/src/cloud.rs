@@ -50,6 +50,13 @@ impl Cloud {
         }
     }
 
+    pub fn off_pause(&self, usage: &Usage) -> Duration {
+        match self {
+            Cloud::Claude(_) => Duration::from_secs(1800),
+            Cloud::Gemini(_) => usage.until_reset() + Duration::from_secs(120),
+        }
+    }
+
     pub fn usage(&self, data: &Path) -> Usage {
         match self {
             Cloud::Claude(_) => Usage::load(data.join("claude_usage.json"), TASHKENT, None),
@@ -343,6 +350,11 @@ fn day_at(secs: i64, offset_h: i64) -> u64 {
     ((secs + offset_h * 3600).max(0) / 86400) as u64
 }
 
+fn left_in_day(secs: i64, offset_h: i64) -> Duration {
+    let s = secs + offset_h * 3600;
+    Duration::from_secs((86400 - s.rem_euclid(86400)) as u64)
+}
+
 fn month_of(day: u64) -> u32 {
     let (y, m, _) = crate::money::civil(day);
     y as u32 * 100 + m
@@ -403,8 +415,7 @@ impl Usage {
     }
 
     pub fn until_reset(&self) -> Duration {
-        let s = now_secs() + self.offset_h * 3600;
-        Duration::from_secs((86400 - s.rem_euclid(86400)) as u64)
+        left_in_day(now_secs(), self.offset_h)
     }
 
     pub fn line(&mut self, name: &str) -> String {
@@ -474,6 +485,53 @@ mod tests {
         assert_eq!((pg.batch, pg.workers, pg.gap), (80, 1, Duration::from_millis(4300)));
         assert!(pg.busy_wait > pc.busy_wait);
         assert_eq!((c.usage(&dir).limit, g.usage(&dir).limit), (None, Some(500)));
+    }
+
+    #[test]
+    fn switched_off_claude_waits_half_an_hour_and_gemini_until_its_quota_resets() {
+        let dir = std::env::temp_dir().join(format!("tbtr_op_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c = Cloud::Claude(Claude::new("k".into()).unwrap());
+        assert_eq!(c.off_pause(&c.usage(&dir)), Duration::from_secs(1800));
+        let g = Cloud::Gemini(gemini());
+        let u = g.usage(&dir);
+        let before = u.until_reset();
+        let p = g.off_pause(&u);
+        assert!(p >= before + Duration::from_secs(119) && p <= before + Duration::from_secs(120), "{p:?} vs {before:?}");
+    }
+
+    #[test]
+    fn days_and_resets_follow_the_ledgers_time_zone() {
+        let t = 1_794_528_000;
+        assert!(now_secs() > t, "the clock is read, not a constant");
+        assert_eq!(day_at(t, 0), 20_770);
+        assert_eq!(day_at(t - 1, 0), 20_769);
+        assert_eq!(day_at(t, PACIFIC), 20_769, "midnight UTC is still yesterday in California");
+        assert_eq!(day_at(t, TASHKENT), 20_770);
+        assert_eq!(day_at(10, PACIFIC), 0, "never below the epoch");
+        assert_eq!(left_in_day(t, 0), Duration::from_secs(86_400));
+        assert_eq!(left_in_day(t + 3_600, 0), Duration::from_secs(82_800));
+        assert_eq!(left_in_day(t, PACIFIC), Duration::from_secs(8 * 3600));
+        assert_eq!(left_in_day(t, TASHKENT), Duration::from_secs(19 * 3600));
+    }
+
+    #[test]
+    fn claude_cost_counts_cache_writes_and_reads() {
+        let v = json!({"stop_reason": "end_turn", "content": [{"type": "text", "text": "{}"}],
+            "usage": {"input_tokens": 1_000_000, "cache_creation_input_tokens": 1_000_000, "cache_read_input_tokens": 1_000_000, "output_tokens": 1_000_000}});
+        let (_, usd) = claude_object("claude-haiku-5-5", &v).unwrap();
+        assert!((usd - (0.10 + 0.125 + 0.01 + 0.50)).abs() < 1e-9, "{usd}");
+        let (_, usd) = claude_object("claude-opus-5-5", &v).unwrap();
+        assert!((usd - (4.0 + 5.0 + 0.4 + 20.0)).abs() < 1e-9, "{usd}");
+        let (_, usd) = claude_object("claude-sonnet-5-5", &v).unwrap();
+        assert!((usd - (2.0 + 2.5 + 0.2 + 10.0)).abs() < 1e-9, "{usd}");
+    }
+
+    #[test]
+    fn newer_flash_lite_wins_over_older() {
+        let m = |n: &str| json!({"name": format!("models/{n}"), "supportedGenerationMethods": ["generateContent"]});
+        assert_eq!(pick_model(&json!({"models": [m("gemini-2.5-flash-lite"), m("gemini-3.5-flash-lite"), m("gemini-3.0-flash-lite")]})).unwrap(), "gemini-3.5-flash-lite");
+        assert_eq!(pick_model(&json!({"models": [m("gemini-2.5-flash"), m("gemini-3.0-flash")]})).unwrap(), "gemini-3.0-flash");
     }
 
     #[test]
